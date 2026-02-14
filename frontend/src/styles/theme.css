@@ -1,0 +1,14 @@
+/* Wholesale POS – global color theme */
+:root {
+  --wholesale-primary: #0f766e;
+  --wholesale-primary-hover: #0d9488;
+  --wholesale-primary-light: #14b8a6;
+  --wholesale-dark: #134e4a;
+  --wholesale-bg: #f0f4f8;
+  --wholesale-surface: #ffffff;
+  --wholesale-border: #e2e8f0;
+  --wholesale-text: #0f172a;
+  --wholesale-text-muted: #64748b;
+  --wholesale-success: #059669;
+  --wholesale-header: linear-gradient(135deg, #0f766e 0%, #134e4a 100%);
+}

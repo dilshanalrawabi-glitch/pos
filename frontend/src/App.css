@@ -1,0 +1,218 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+#root {
+  width: 100%;
+  height: 100vh;
+}
+
+body {
+  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+  background: #f0f4f8;
+}
+
+.app {
+  display: flex;
+  height: 100vh;
+  background: #f0f4f8;
+}
+
+.main-area {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.top-bar {
+  background: linear-gradient(135deg, #0f766e 0%, #134e4a 100%);
+  color: white;
+  padding: 20px 30px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  box-shadow: 0 2px 8px rgba(15, 118, 110, 0.2);
+  gap: 16px;
+}
+
+.menu-toggle-btn {
+  display: flex;
+  flex-shrink: 0;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  background: rgba(255, 255, 255, 0.2);
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  border-radius: 8px;
+  color: white;
+  cursor: pointer;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.2s;
+}
+
+.menu-toggle-btn:hover {
+  background: rgba(255, 255, 255, 0.3);
+}
+
+.menu-toggle-icon {
+  font-size: 24px;
+  line-height: 1;
+}
+
+.sidebar-backdrop {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  z-index: 1000;
+  transition: opacity 0.2s;
+}
+
+.sidebar-backdrop.visible {
+  display: block;
+}
+
+.top-bar h1 {
+  font-size: 28px;
+  margin: 0;
+  flex: 1;
+  min-width: 0;
+}
+
+.header-pos-info {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 20px;
+  align-items: center;
+  font-size: 13px;
+  opacity: 0.95;
+}
+
+.header-pos-info span {
+  white-space: nowrap;
+}
+
+.header-info {
+  display: flex;
+  gap: 20px;
+  align-items: center;
+}
+
+.auth-loading {
+  align-items: center;
+  justify-content: center;
+}
+
+.loading-spinner {
+  color: white;
+  font-size: 18px;
+}
+
+.role-badge {
+  background: rgba(255, 255, 255, 0.2);
+  padding: 8px 16px;
+  border-radius: 20px;
+  font-weight: 500;
+  font-size: 14px;
+}
+
+.cart-count {
+  background: rgba(255, 255, 255, 0.2);
+  padding: 8px 16px;
+  border-radius: 20px;
+  font-weight: 500;
+}
+
+.content-wrapper {
+  display: flex;
+  flex: 1;
+  gap: 20px;
+  padding: 20px;
+  overflow: hidden;
+}
+
+.content-placeholder {
+  flex: 1;
+  background: white;
+  border-radius: 8px;
+  padding: 24px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+}
+
+.content-placeholder h2 {
+  margin: 0 0 12px 0;
+  font-size: 20px;
+  color: #333;
+}
+
+.content-placeholder p {
+  margin: 0;
+  color: #666;
+  font-size: 14px;
+}
+
+/* Launcher popup (system name + IP when opened via POS Launcher exe) */
+.launcher-popup-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1100;
+}
+
+.launcher-popup {
+  background: white;
+  border-radius: 12px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+  padding: 24px;
+  min-width: 280px;
+}
+
+.launcher-popup-title {
+  margin: 0 0 16px 0;
+  font-size: 18px;
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.launcher-popup-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 12px;
+}
+
+.launcher-popup-label {
+  font-weight: 600;
+  color: #475569;
+}
+
+.launcher-popup-value {
+  font-weight: 600;
+  color: #0f766e;
+}
+
+.launcher-popup-ok {
+  margin-top: 16px;
+  width: 100%;
+  padding: 10px 16px;
+  background: #0f766e;
+  color: white;
+  border: none;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.launcher-popup-ok:hover {
+  background: #134e4a;
+}
+
