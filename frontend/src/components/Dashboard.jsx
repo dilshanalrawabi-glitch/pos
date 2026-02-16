@@ -26,6 +26,8 @@ function Dashboard({
   onCheckout,
   onHold,
   onHoldRetrieve,
+  selectedCartItemId,
+  onSelectCartItem,
   onVoidLine,
   onSuspendBill,
   hasHeldCart,
@@ -37,7 +39,48 @@ function Dashboard({
 }) {
   const [customerSearch, setCustomerSearch] = useState('')
   const [showCustomerDropdown, setShowCustomerDropdown] = useState(false)
+  const [showQtyModal, setShowQtyModal] = useState(false)
+  const [qtySelectedId, setQtySelectedId] = useState(null)
+  const [qtyKeypadInput, setQtyKeypadInput] = useState('')
   const customerSearchRef = useRef(null)
+
+  const getItemId = (item) => item?.id ?? item?.ITEMCODE ?? item?.itemCode ?? ''
+
+  const handleQtyKeypad = (key) => {
+    if (key === '⌫') {
+      setQtyKeypadInput((s) => s.slice(0, -1))
+      return
+    }
+    if (key === 'OK') {
+      if (qtySelectedId !== null && qtySelectedId !== undefined && qtySelectedId !== '') {
+        const val = Math.max(0, parseInt(qtyKeypadInput, 10) || 0)
+        if (typeof onUpdateQuantity === 'function') {
+          onUpdateQuantity(qtySelectedId, val)
+        }
+      }
+      setQtyKeypadInput('')
+      setQtySelectedId(null)
+      setShowQtyModal(false)
+      return
+    }
+    setQtyKeypadInput((s) => (s + key).slice(0, 6))
+  }
+
+  const prevShowQtyModalRef = useRef(false)
+  const selectedCartItemIdRef = useRef(selectedCartItemId)
+  selectedCartItemIdRef.current = selectedCartItemId
+  useEffect(() => {
+    if (showQtyModal && !prevShowQtyModalRef.current && cartItems.length > 0) {
+      const sid = selectedCartItemIdRef.current
+      const selectedItem = sid
+        ? cartItems.find((i) => String(getItemId(i)) === String(sid) && !i.void)
+        : null
+      const item = selectedItem ?? cartItems.find((i) => !i.void) ?? cartItems[0]
+      setQtySelectedId(getItemId(item))
+      setQtyKeypadInput(String(item.quantity ?? 0))
+    }
+    prevShowQtyModalRef.current = showQtyModal
+  }, [showQtyModal, cartItems])
 
   const getCustomerName = (c) => {
     if (!c) return ''
@@ -135,14 +178,49 @@ function Dashboard({
             <PosActionsBar
               cartItems={cartItems}
               hasHeldCart={hasHeldCart}
+              selectedCartItemId={selectedCartItemId}
               onHold={onHold}
               onHoldRetrieve={onHoldRetrieve}
               onVoidLine={onVoidLine}
               onSuspendBill={onSuspendBill}
+              onQty={() => setShowQtyModal(true)}
               onCheckout={onCheckout}
             />
           </section>
         </aside>
+        {showQtyModal && (
+          <div className="qty-modal-overlay" onClick={() => setShowQtyModal(false)}>
+            <div className="qty-modal qty-modal-with-keypad" onClick={e => e.stopPropagation()}>
+              <div className="qty-modal-header">
+                <h3>Edit quantity</h3>
+                <button type="button" className="qty-modal-close" onClick={() => setShowQtyModal(false)} aria-label="Close">×</button>
+              </div>
+              <div className="qty-modal-body">
+                {cartItems.length === 0 ? (
+                  <p className="qty-modal-empty">Cart is empty.</p>
+                ) : qtySelectedId == null || qtySelectedId === '' ? (
+                  <p className="qty-modal-empty">Select an item in the cart, then click Quantity.</p>
+                ) : (
+                  <div className="qty-keypad-wrap">
+                    <p className="qty-keypad-hint">
+                      {cartItems.find(i => String(getItemId(i)) === String(qtySelectedId))?.name || 'Item'}
+                    </p>
+                    <div className="qty-keypad-label">Quantity</div>
+                    <div className="qty-keypad-display">{qtyKeypadInput || '0'}</div>
+                    <div className="qty-keypad">
+                      {['1', '2', '3', '4', '5', '6', '7', '8', '9'].map((d) => (
+                        <button key={d} type="button" className="qty-keypad-key" onClick={() => handleQtyKeypad(d)}>{d}</button>
+                      ))}
+                      <button type="button" className="qty-keypad-key qty-keypad-back" onClick={() => handleQtyKeypad('⌫')}>⌫</button>
+                      <button type="button" className="qty-keypad-key" onClick={() => handleQtyKeypad('0')}>0</button>
+                      <button type="button" className="qty-keypad-key qty-keypad-ok" onClick={() => handleQtyKeypad('OK')}>OK</button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
         <section className="dashboard-cart-section">
           <CartSummary
             cartItems={cartItems}
@@ -157,6 +235,8 @@ function Dashboard({
             products={products}
             onAddToCart={onAddToCart}
             apiBase={apiBase}
+            selectedItemId={selectedCartItemId}
+            onSelectItem={(item) => onSelectCartItem?.(getItemId(item))}
           />
         </section>
       </div>

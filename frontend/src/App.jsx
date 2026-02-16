@@ -1,10 +1,11 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import Sidebar from './components/Sidebar'
 import ProductDisplay from './components/ProductDisplay'
 import CartSummary from './components/CartSummary'
 import CustomerList from './components/CustomerList'
 import UserManagement from './components/UserManagement'
 import CounterSetup from './components/CounterSetup'
+import CounterOpen from './components/CounterOpen'
 import Dashboard from './components/Dashboard'
 import Payment from './components/Payment'
 import Login from './components/Login'
@@ -44,6 +45,7 @@ function App() {
   const [customers, setCustomers] = useState([])
   const [selectedCustomer, setSelectedCustomer] = useState(null)
   const [showPaymentPage, setShowPaymentPage] = useState(false)
+  const [selectedCartItemId, setSelectedCartItemId] = useState(null)
   const [showLauncherPopup, setShowLauncherPopup] = useState(false)
 
   // Show launcher popup (name + IP) when opened via POS Launcher exe
@@ -74,6 +76,21 @@ function App() {
       .finally(() => setAuthLoading(false))
   }, [token])
 
+  // Set bill no to nextBillNo from backend (BILLNOTABLE) when user is logged in
+  useEffect(() => {
+    if (!user) return
+    fetch(`${API_BASE}/api/billno/check`)
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.ok && data.nextBillNo != null) {
+          const next = Number(data.nextBillNo)
+          setBillNo(next)
+          localStorage.setItem('pos_bill_no', String(next))
+        }
+      })
+      .catch(() => {})
+  }, [user])
+
   const handleLogin = async ({ username, password }) => {
     setLoginError(null)
     setAuthLoading(true)
@@ -102,6 +119,34 @@ function App() {
     setCart([])
   }
 
+  const fetchAndSetNextBillNo = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/billno/next`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ flag: 0 }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (res.ok && data.billNo != null) {
+        const next = Number(data.billNo)
+        setBillNo(next)
+        localStorage.setItem('pos_bill_no', String(next))
+      } else {
+        setBillNo((prev) => {
+          const next = prev + 1
+          localStorage.setItem('pos_bill_no', String(next))
+          return next
+        })
+      }
+    } catch {
+      setBillNo((prev) => {
+        const next = prev + 1
+        localStorage.setItem('pos_bill_no', String(next))
+        return next
+      })
+    }
+  }
+
   const handleHold = async () => {
     if (cart.length === 0) return
     try {
@@ -119,6 +164,7 @@ function App() {
       const data = await res.json()
       if (!res.ok) throw new Error(data.error || 'Hold failed')
       setCart([])
+      await fetchAndSetNextBillNo()
     } catch (err) {
       alert(err.message || 'Failed to hold bill')
     }
@@ -136,9 +182,15 @@ function App() {
   }
 
   const handleVoidLine = () => {
-    if (cart.length === 0) return
-    const last = cart[cart.length - 1]
-    removeFromCart(last.id)
+    if (!selectedCartItemId) return
+    setCart(prev => {
+      const next = prev.map(item =>
+        sameId(getItemId(item), selectedCartItemId) ? { ...item, void: true } : item
+      )
+      syncCartToDb(next)
+      return next
+    })
+    setSelectedCartItemId(null)
   }
 
   const handleSuspendBill = () => {
@@ -210,44 +262,50 @@ function App() {
     }).catch(err => console.error('Cart sync failed:', err))
   }
 
+  const getItemId = (item) => item?.id ?? item?.ITEMCODE ?? item?.itemCode ?? ''
+  const sameId = (a, b) => String(a ?? '') === String(b ?? '')
+
   const addToCart = (product) => {
-    const existingItem = cart.find(item => item.id === product.id)
-    let newCart
-    if (existingItem) {
-      newCart = cart.map(item =>
-        item.id === product.id
-          ? { ...item, quantity: item.quantity + 1 }
-          : item
-      )
-    } else {
-      newCart = [...cart, { ...product, quantity: 1 }]
-    }
-    setCart(newCart)
-    syncCartToDb(newCart)
+    setCart(prev => {
+      const pid = getItemId(product)
+      const existingItem = prev.find(item => sameId(getItemId(item), pid))
+      const newCart = existingItem
+        ? prev.map(item =>
+            sameId(getItemId(item), pid) ? { ...item, quantity: item.quantity + 1 } : item
+          )
+        : [...prev, { ...product, quantity: 1 }]
+      syncCartToDb(newCart)
+      return newCart
+    })
   }
 
   const removeFromCart = (productId) => {
-    const newCart = cart.filter(item => item.id !== productId)
-    setCart(newCart)
-    syncCartToDb(newCart)
+    setCart(prev => {
+      const newCart = prev.filter(item => !sameId(getItemId(item), productId))
+      syncCartToDb(newCart)
+      return newCart
+    })
   }
 
-  const updateQuantity = (productId, quantity) => {
-    if (quantity <= 0) {
-      removeFromCart(productId)
-    } else {
-      const newCart = cart.map(item =>
-        item.id === productId
-          ? { ...item, quantity }
-          : item
+  const updateQuantity = useCallback((productId, quantity) => {
+    const qty = Math.max(0, Number(quantity) || 0)
+    setCart(prev => {
+      if (qty <= 0) {
+        const newCart = prev.filter(item => !sameId(getItemId(item), productId))
+        syncCartToDb(newCart)
+        return newCart
+      }
+      const newCart = prev.map(item =>
+        sameId(getItemId(item), productId) ? { ...item, quantity: qty } : item
       )
-      setCart(newCart)
       syncCartToDb(newCart)
-    }
-  }
+      return newCart
+    })
+  }, [])
 
   const clearCart = () => {
     setCart([])
+    setSelectedCartItemId(null)
     syncCartToDb([])
   }
 
@@ -263,13 +321,10 @@ function App() {
     if (cart.length > 0) setShowPaymentPage(true)
   }
 
-  const completePayment = () => {
+  const completePayment = async () => {
     clearCart()
-    setBillNo((prev) => {
-      const next = prev + 1
-      localStorage.setItem('pos_bill_no', String(next))
-      return next
-    })
+    setSelectedCartItemId(null)
+    await fetchAndSetNextBillNo()
     setShowPaymentPage(false)
   }
 
@@ -397,6 +452,8 @@ function App() {
                   onCheckout={goToPayment}
                   onHold={handleHold}
                   onHoldRetrieve={handleHoldRetrieve}
+                  selectedCartItemId={selectedCartItemId}
+                  onSelectCartItem={setSelectedCartItemId}
                   onVoidLine={handleVoidLine}
                   onSuspendBill={handleSuspendBill}
                   hasHeldCart={true}
@@ -418,11 +475,15 @@ function App() {
             <CounterSetup
               counterCode={counterCode}
               counterName={counterName}
+              apiBase={API_BASE}
               onSave={(code, name) => {
                 setCounterCode(code)
                 setCounterName(name)
               }}
             />
+          )}
+          {activeView === 'counter-open' && (
+            <CounterOpen apiBase={API_BASE} />
           )}
           {activeView === 'orders' && (
             <div className="content-placeholder">

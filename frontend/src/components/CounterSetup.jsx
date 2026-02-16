@@ -1,12 +1,13 @@
 import { useState, useEffect } from 'react'
 import '../styles/CounterSetup.css'
 
-function CounterSetup({ counterCode, counterName, onSave }) {
+function CounterSetup({ counterCode, counterName, apiBase, onSave }) {
   const [systemName, setSystemName] = useState('')
   const [ipAddress, setIpAddress] = useState('')
-  const [code, setCode] = useState(counterCode || '')
+  const [code, setCode] = useState('')
   const [name, setName] = useState(counterName || '')
   const [saved, setSaved] = useState(false)
+  const [loadingCode, setLoadingCode] = useState(!!apiBase)
 
   useEffect(() => {
     if (typeof window !== 'undefined') {
@@ -15,14 +16,31 @@ function CounterSetup({ counterCode, counterName, onSave }) {
     }
   }, [])
 
+  // Fetch counter code from COUNTER table (last COUNTERCODE + 1); show only, not editable
   useEffect(() => {
-    setCode(counterCode || '')
+    if (!apiBase) {
+      setLoadingCode(false)
+      return
+    }
+    setLoadingCode(true)
+    fetch(`${apiBase}/api/counters/next-code`)
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.ok && data.nextCounterCode != null) {
+          setCode(String(data.nextCounterCode).trim())
+        }
+      })
+      .catch(() => {})
+      .finally(() => setLoadingCode(false))
+  }, [apiBase])
+
+  useEffect(() => {
     setName(counterName || '')
-  }, [counterCode, counterName])
+  }, [counterName])
 
   const handleSubmit = (e) => {
     e.preventDefault()
-    const trimmedCode = (code || '').trim() || 'CNT01'
+    const trimmedCode = (code || '').trim() || '1'
     const trimmedName = (name || '').trim() || 'Counter 1'
     if (typeof window !== 'undefined') {
       localStorage.setItem('pos_counter_code', trimmedCode)
@@ -69,14 +87,19 @@ function CounterSetup({ counterCode, counterName, onSave }) {
           <h3>Counter settings</h3>
           <div className="counter-setup-row">
             <label className="counter-setup-label" htmlFor="counter-code">Counter code</label>
-            <input
-              id="counter-code"
-              type="text"
-              className="counter-setup-input"
-              value={code}
-              onChange={(e) => setCode(e.target.value)}
-              placeholder="e.g. CNT01"
-            />
+            {loadingCode ? (
+              <span className="counter-setup-code-loading">Loading…</span>
+            ) : (
+              <input
+                id="counter-code"
+                type="text"
+                className="counter-setup-input counter-setup-readonly"
+                value={code}
+                readOnly
+                placeholder="From DB: last COUNTERCODE + 1"
+                aria-label="Counter code (from database)"
+              />
+            )}
           </div>
           <div className="counter-setup-row">
             <label className="counter-setup-label" htmlFor="counter-name">Counter name</label>

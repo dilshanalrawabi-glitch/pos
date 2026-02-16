@@ -1,6 +1,10 @@
 import { useState, useRef, useEffect } from 'react'
 import '../styles/CartSummary.css'
 
+function getItemId(item) {
+  return item?.id ?? item?.ITEMCODE ?? item?.itemCode ?? ''
+}
+
 function CartSummary({
   cartItems,
   customers = [],
@@ -14,13 +18,16 @@ function CartSummary({
   products = [],
   onAddToCart,
   apiBase,
+  selectedItemId,
+  onSelectItem,
 }) {
   const [scanCode, setScanCode] = useState('')
   const [scanMsg, setScanMsg] = useState(null)
   const scanInputRef = useRef(null)
 
-  const total = cartItems.reduce((sum, item) => sum + (item.price * item.quantity), 0)
-  const itemCount = cartItems.reduce((sum, item) => sum + item.quantity, 0)
+  const activeItems = cartItems.filter(item => !item.void)
+  const total = activeItems.reduce((sum, item) => sum + (item.price * item.quantity), 0)
+  const itemCount = activeItems.reduce((sum, item) => sum + item.quantity, 0)
 
   const getCustomerName = (c) => {
     if (!c) return ''
@@ -46,19 +53,19 @@ function CartSummary({
     if (apiBase) {
       try {
         const res = await fetch(`${apiBase}/api/products/lookup?code=${encodeURIComponent(code)}`)
-        if (res.ok) {
-          const data = await res.json()
+        const data = await res.json().catch(() => ({}))
+        if (res.ok && data.found !== false && (data.ITEMCODE != null || data.itemcode != null)) {
           product = {
-            id: data.ITEMCODE,
-            name: data.ITEMNAME,
-            price: parseFloat(data.RETAILPRICE) || 0,
-            category: data.CATEGORYCODE,
+            id: data.ITEMCODE ?? data.itemcode,
+            name: data.ITEMNAME ?? data.itemname ?? '',
+            price: parseFloat(data.RETAILPRICE ?? data.retailprice) || 0,
+            category: data.CATEGORYCODE ?? data.categorycode,
             image: '📦',
-            manufactureId: (data.MANUFACTUREID ?? data.manufactureid ?? data.ITEMCODE ?? '').toString().trim(),
+            manufactureId: (data.MANUFACTUREID ?? data.manufactureid ?? data.ITEMCODE ?? data.itemcode ?? '').toString().trim(),
           }
         }
       } catch (err) {
-        console.error('Lookup error:', err)
+        console.warn('Lookup error:', err)
       }
     }
     if (!product) {
@@ -102,7 +109,6 @@ function CartSummary({
               className="cart-scan-input"
               autoComplete="off"
             />
-            <button type="submit" className="cart-scan-btn">Add</button>
           </div>
           {scanMsg && <span className="cart-scan-msg">{scanMsg}</span>}
         </form>
@@ -132,39 +138,48 @@ function CartSummary({
             <p>Your cart is empty</p>
           </div>
         ) : (
-          cartItems.map(item => (
-            <div key={item.id} className="cart-item">
-              <div className="item-info">
-                <p className="item-emoji">{item.image}</p>
-                <div className="item-details">
-                  <p className="item-name">{item.name}</p>
-                  <p className="item-price">QAR {item.price.toFixed(2)}</p>
-                </div>
-              </div>
-              <div className="item-controls">
-                <button
-                  className="qty-btn"
-                  onClick={() => onUpdateQuantity(item.id, item.quantity - 1)}
-                >
-                  −
-                </button>
-                <span className="qty-display">{item.quantity}</span>
-                <button
-                  className="qty-btn"
-                  onClick={() => onUpdateQuantity(item.id, item.quantity + 1)}
-                >
-                  +
-                </button>
-              </div>
-              <p className="item-total">QAR {(item.price * item.quantity).toFixed(2)}</p>
-              <button
-                className="remove-btn"
-                onClick={() => onRemove(item.id)}
-              >
-                ✕
-              </button>
+          <>
+            <div className="cart-items-header">
+              <span className="cart-th cart-th-sno">Sl No</span>
+              <span className="cart-th cart-th-name">Name</span>
+              <span className="cart-th cart-th-qty">Qty</span>
+              <span className="cart-th cart-th-price">Price</span>
+              <span className="cart-th cart-th-total">Total</span>
             </div>
-          ))
+            <div className="cart-items-list">
+              {cartItems.map((item, index) => {
+                const id = getItemId(item)
+                const isSelected = selectedItemId != null && String(id) === String(selectedItemId)
+                const isVoid = !!item.void
+                return (
+                  <div
+                    key={id || index}
+                    role="button"
+                    tabIndex={0}
+                    className={`cart-item-row ${isSelected ? 'cart-item-row-selected' : ''} ${isVoid ? 'cart-item-row-void' : ''}`}
+                    onClick={() => !isVoid && onSelectItem?.(item)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault()
+                        if (!isVoid) onSelectItem?.(item)
+                      }
+                    }}
+                    aria-pressed={isSelected}
+                    aria-label={isVoid ? `${item.name} (void)` : item.name}
+                  >
+                    <span className="cart-td cart-td-sno">{index + 1}</span>
+                    <span className="cart-td cart-td-name" title={item.name}>
+                      {item.name}
+                      {isVoid && <span className="cart-item-void-badge">VOID</span>}
+                    </span>
+                    <span className="cart-td cart-td-qty">{item.quantity}</span>
+                    <span className="cart-td cart-td-price">QAR {item.price.toFixed(2)}</span>
+                    <span className="cart-td cart-td-total">QAR {(item.price * item.quantity).toFixed(2)}</span>
+                  </div>
+                )
+              })}
+            </div>
+          </>
         )}
       </div>
 

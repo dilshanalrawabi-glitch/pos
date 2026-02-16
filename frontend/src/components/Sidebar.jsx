@@ -11,7 +11,10 @@ function Sidebar({ activeMenu = 'items', onMenuSelect, user, onLogout, isOpen, o
     { id: 'items', label: 'Dashboard', icon: '📦' },
     { id: 'orders', label: 'Orders', icon: '🛒' },
     { id: 'customers', label: 'Customers', icon: '👥' },
-    ...(isAdmin ? [{ id: 'counter-setup', label: 'Counter Setup', icon: '🖥️' }] : []),
+    ...(isAdmin ? [
+      { id: 'counter-setup', label: 'Counter Setup', icon: '🖥️' },
+      { id: 'counter-open', label: 'Counter Open', icon: '🖥️' },
+    ] : []),
     ...(isManager ? [{ id: 'users', label: 'Users', icon: '👤' }] : []),
     { id: 'settings', label: 'Settings', icon: '⚙️' },
   ]
@@ -97,7 +100,14 @@ function Sidebar({ activeMenu = 'items', onMenuSelect, user, onLogout, isOpen, o
           {activeMenu === 'counter-setup' && (
             <section>
               <h3>Counter Setup</h3>
-              <p className="info-text">System name, IP (from .exe), counter code and name. Admin only.</p>
+              <p className="info-text">System name, IP, counter code, name, date and shift.</p>
+            </section>
+          )}
+
+          {activeMenu === 'counter-open' && (
+            <section>
+              <h3>Counter Open</h3>
+              <p className="info-text">Open counter setup screen.</p>
             </section>
           )}
 

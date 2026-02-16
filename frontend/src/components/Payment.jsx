@@ -42,7 +42,8 @@ function Payment({
   const [amountTendered, setAmountTendered] = useState('')
   const [pointsUsed, setPointsUsed] = useState(0)
 
-  const subtotal = cartItems.reduce((sum, item) => sum + item.price * item.quantity, 0)
+  const activeItems = cartItems.filter((item) => !item.void)
+  const subtotal = activeItems.reduce((sum, item) => sum + item.price * item.quantity, 0)
   const taxRate = 0.1
   const tax = subtotal * taxRate
   const total = subtotal + tax
@@ -109,9 +110,13 @@ function Payment({
             <div className="payment-order-label">TOTAL AMOUNT</div>
             <div className="payment-order-total">QAR {total.toFixed(2)}</div>
             <ul className="payment-order-lines">
-              {cartItems.map((item) => (
-                <li key={item.id} className="payment-order-line">
+              {cartItems.map((item, idx) => (
+                <li
+                  key={item.id ?? item.ITEMCODE ?? idx}
+                  className={`payment-order-line ${item.void ? 'payment-order-line-void' : ''}`}
+                >
                   {item.name} x{item.quantity}
+                  {item.void && <span className="payment-void-badge">VOID</span>}
                 </li>
               ))}
             </ul>

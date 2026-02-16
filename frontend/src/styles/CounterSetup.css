@@ -87,6 +87,11 @@
   cursor: default;
 }
 
+.counter-setup-code-loading {
+  font-size: 14px;
+  color: #94a3b8;
+}
+
 .counter-setup-actions {
   display: flex;
   align-items: center;
@@ -114,4 +119,46 @@
   font-size: 14px;
   color: #0f766e;
   font-weight: 500;
+}
+
+.counter-setup-list {
+  margin-bottom: 24px;
+}
+
+.counter-setup-muted {
+  margin: 0;
+  font-size: 14px;
+  color: #94a3b8;
+}
+
+.counter-setup-table-wrap {
+  overflow-x: auto;
+  margin-top: 8px;
+}
+
+.counter-setup-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.counter-setup-table th,
+.counter-setup-table td {
+  padding: 8px 12px;
+  text-align: left;
+  border: 1px solid #e2e8f0;
+}
+
+.counter-setup-table th {
+  background: #0f766e;
+  color: white;
+  font-weight: 600;
+}
+
+.counter-setup-table tbody tr:nth-child(even) {
+  background: #f8fafc;
+}
+
+.counter-setup-table tbody tr:hover {
+  background: #f0fdfa;
 }

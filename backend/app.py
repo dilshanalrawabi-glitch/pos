@@ -375,9 +375,10 @@ def lookup_product():
         cursor.execute(query, code=code)
         row = cursor.fetchone()
         if not row:
-            return jsonify({"error": "Product not found", "code": code}), 404
+            return jsonify({"found": False, "code": code, "error": "Product not found"}), 200
         columns = [col[0] for col in cursor.description]
         result = dict(zip(columns, row))
+        result["found"] = True
         return jsonify(result)
     except oracledb.Error as e:
         err_msg = str(e).upper()
@@ -403,16 +404,17 @@ def lookup_product():
                 cursor.execute(query, code=code)
                 row = cursor.fetchone()
                 if not row:
-                    return jsonify({"error": "Product not found", "code": code}), 404
+                    return jsonify({"found": False, "code": code, "error": "Product not found"}), 200
                 cols = [c[0] for c in cursor.description]
                 result = dict(zip(cols, row))
                 result['MANUFACTUREID'] = str(result.get('ITEMCODE', ''))
+                result["found"] = True
                 return jsonify(result)
             except oracledb.Error as e2:
                 print(f"Oracle lookup error: {e2}")
         else:
             print(f"Oracle lookup error: {e}")
-        return jsonify({"error": "Product not found", "code": code}), 404
+        return jsonify({"found": False, "code": code, "error": "Product not found"}), 200
     finally:
         if cursor:
             try:
@@ -502,7 +504,9 @@ def get_products():
 # --- Hold / cart bills (Oracle) or in-memory fallback ---
 # Change this constant when you rename the DB table (one place for all hold/cart SQL).
 HOLD_TABLE_NAME = 'TEMPBILLHDR'
-# Columns expected: BILLNO, LOCATIONCODE, FLAG NUMBER DEFAULT 1. No QUANTITY, no RATE, no ITEMCODE — one row per unit.
+BILLNO_TABLE_NAME = 'BILLNOTABLE'
+# BILLNOTABLE columns: BILLNO NUMBER, FLAG CHAR(1) DEFAULT 'n' (n/y), BILLDATE (required).
+# HOLD table (TEMPBILLHDR): BILLNO, LOCATIONCODE, FLAG. FLAG=0 held, FLAG=1 draft.
 _held_bills_fallback = {}  # key: (location_code, bill_no) -> { "counterCode", "heldDate", "customerCode", "items": [...] }
 
 
@@ -571,9 +575,213 @@ def _location_to_num(location_code, default=1):
     return _to_int(digits, default) if digits else default
 
 
+def _ensure_billnotable(cur):
+    """Create BILLNOTABLE if not exists. Columns: BILLNO NUMBER, FLAG CHAR(1) DEFAULT 'n', BILLDATE DATE."""
+    create_sql = f"""
+        CREATE TABLE {BILLNO_TABLE_NAME} (
+            BILLNO NUMBER NOT NULL,
+            FLAG CHAR(1) DEFAULT 'n',
+            BILLDATE DATE DEFAULT SYSDATE NOT NULL
+        )
+    """
+    try:
+        cur.execute(create_sql)
+    except oracledb.Error as e:
+        err_str = str(e).upper()
+        if 'ORA-00955' in err_str or '00955' in err_str:
+            pass
+        elif 'ORA-01031' in err_str or '01031' in err_str:
+            pass
+        else:
+            print(f"[BillNo] {BILLNO_TABLE_NAME} create failed: {e}")
+            raise
+
+
+def _billno_flag_char(value):
+    """Normalize FLAG for BILLNOTABLE to 'n' or 'y' (CHAR(1)). Default 'n'."""
+    if value is None:
+        return 'n'
+    s = str(value).strip().lower()
+    return 'y' if s == 'y' else 'n'
+
+
+@app.route('/api/billno/next', methods=['GET', 'POST'])
+def create_next_billno():
+    """
+    Create next bill no: fetch last BILLNO from BILLNOTABLE, set new_billno = last + 1.
+    new_billno is returned; same is inserted into BILLNOTABLE with FLAG = 'n' (or 'y') and BILLDATE.
+    """
+    data = request.get_json(silent=True) or {} if request.method == 'POST' else {}
+    raw_flag = data.get('flag') or request.args.get('flag') or 'n'
+    flag_val = _billno_flag_char(raw_flag)
+    conn = _get_connection()
+    if not conn:
+        return jsonify({"error": "Database unavailable", "billNo": None}), 503
+    cur = None
+    try:
+        cur = conn.cursor()
+        _ensure_billnotable(cur)
+        cur.execute(f"SELECT NVL(MAX(BILLNO), 0) AS LAST_BILLNO FROM {BILLNO_TABLE_NAME}")
+        row = cur.fetchone()
+        last_billno = _to_int(row[0], 0) if row else 0
+        new_billno = last_billno + 1
+        # Insert new_billno with FLAG 'n'/'y' (CHAR(1)) and BILLDATE
+        cur.execute(
+            f"INSERT INTO {BILLNO_TABLE_NAME} (BILLNO, FLAG, BILLDATE) VALUES (:billno, :flag, SYSDATE)",
+            {"billno": new_billno, "flag": flag_val}
+        )
+        conn.commit()
+        return jsonify({"ok": True, "billNo": new_billno})
+    except oracledb.Error as e:
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        print(f"[BillNo] {BILLNO_TABLE_NAME} error: {e}")
+        return jsonify({"ok": False, "error": str(e), "billNo": None}), 500
+    finally:
+        if cur:
+            try:
+                cur.close()
+            except Exception:
+                pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.route('/api/billno/check', methods=['GET'])
+def check_billno():
+    """Check last and next bill no from BILLNOTABLE (read-only, no insert)."""
+    conn = _get_connection()
+    if not conn:
+        return jsonify({"error": "Database unavailable", "lastBillNo": None, "nextBillNo": None}), 503
+    cur = None
+    try:
+        cur = conn.cursor()
+        _ensure_billnotable(cur)
+        cur.execute(f"SELECT NVL(MAX(BILLNO), 0) AS LAST_BILLNO FROM {BILLNO_TABLE_NAME}")
+        row = cur.fetchone()
+        last_billno = _to_int(row[0], 0) if row else 0
+        next_billno = last_billno + 1
+        return jsonify({
+            "ok": True,
+            "lastBillNo": last_billno,
+            "nextBillNo": next_billno,
+        })
+    except oracledb.Error as e:
+        print(f"[BillNo] check error: {e}")
+        return jsonify({"ok": False, "error": str(e), "lastBillNo": None, "nextBillNo": None}), 500
+    finally:
+        if cur:
+            try:
+                cur.close()
+            except Exception:
+                pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+# --- Counter table (fetch only COUNTERCODE for Counter Open) ---
+COUNTER_TABLE_NAME = 'COUNTER'
+
+
+def _ensure_counter_table(cur):
+    """Create COUNTER table if not exists. Only COUNTERCODE column."""
+    create_sql = f"""
+        CREATE TABLE {COUNTER_TABLE_NAME} (
+            COUNTERCODE VARCHAR2(50)
+        )
+    """
+    try:
+        cur.execute(create_sql)
+    except oracledb.Error as e:
+        err_str = str(e).upper()
+        if 'ORA-00955' in err_str or '00955' in err_str:
+            pass
+        else:
+            print(f"[Counter] {COUNTER_TABLE_NAME} create failed: {e}")
+
+
+@app.route('/api/counters', methods=['GET'])
+def list_counters():
+    """Fetch only COUNTERCODE from COUNTER."""
+    conn = _get_connection()
+    if not conn:
+        return jsonify({"ok": False, "counters": [], "error": "Database unavailable"}), 503
+    cur = None
+    try:
+        cur = conn.cursor()
+        _ensure_counter_table(cur)
+        cur.execute(f"SELECT COUNTERCODE FROM {COUNTER_TABLE_NAME}")
+        rows = cur.fetchall()
+        result = [{"counterCode": (row[0] or "").strip()} for row in rows]
+        return jsonify({"ok": True, "counters": result})
+    except oracledb.Error as e:
+        print(f"[Counter] list error: {e}")
+        return jsonify({"ok": False, "counters": [], "error": str(e)}), 500
+    finally:
+        if cur:
+            try:
+                cur.close()
+            except Exception:
+                pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.route('/api/counters/next-code', methods=['GET'])
+def next_counter_code():
+    """Return next counter code: last COUNTERCODE from COUNTER + 1 (numeric)."""
+    conn = _get_connection()
+    if not conn:
+        return jsonify({"ok": False, "nextCounterCode": "1", "error": "Database unavailable"}), 503
+    cur = None
+    try:
+        cur = conn.cursor()
+        _ensure_counter_table(cur)
+        cur.execute(f"SELECT COUNTERCODE FROM {COUNTER_TABLE_NAME} WHERE COUNTERCODE IS NOT NULL")
+        rows = cur.fetchall()
+        max_num = 0
+        for row in rows:
+            val = row[0]
+            if val is None:
+                continue
+            s = str(val).strip()
+            digits = ''.join(c for c in s if c.isdigit())
+            if digits:
+                try:
+                    n = int(digits)
+                    if n > max_num:
+                        max_num = n
+                except ValueError:
+                    pass
+        next_code = str(max_num + 1)
+        return jsonify({"ok": True, "nextCounterCode": next_code})
+    except oracledb.Error as e:
+        print(f"[Counter] next-code error: {e}")
+        return jsonify({"ok": False, "nextCounterCode": "1", "error": str(e)}), 500
+    finally:
+        if cur:
+            try:
+                cur.close()
+            except Exception:
+                pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 @app.route('/api/hold', methods=['POST'])
 def hold_bill():
-    """On hold: set FLAG=1 for current bill's cart rows in hold table (cart list flag change to 1)."""
+    """On hold: set FLAG=0 for current bill's cart rows (held). Draft cart uses FLAG=1; held uses FLAG=0."""
     data = request.get_json(silent=True) or {}
     bill_no = data.get('billNo')
     location_code = (data.get('locationCode') or '').strip() or 'LOC001'
@@ -592,28 +800,29 @@ def hold_bill():
         try:
             cur = conn.cursor()
             _ensure_tempbillhdr(cur)
+            # Mark existing draft rows (FLAG=1 or NULL) as held (FLAG=0)
             cur.execute(f"""
-                UPDATE {HOLD_TABLE_NAME} SET FLAG = 1
-                WHERE BILLNO = :billno AND LOCATIONCODE = :loc AND (FLAG = 0 OR FLAG IS NULL)
+                UPDATE {HOLD_TABLE_NAME} SET FLAG = 0
+                WHERE BILLNO = :billno AND LOCATIONCODE = :loc AND (FLAG = 1 OR FLAG IS NULL)
             """, billno=bill_no, loc=loc_num)
             updated = cur.rowcount
             conn.commit()
-            if updated > 0:
-                return jsonify({"ok": True, "billNo": bill_no, "locationCode": location_code, "savedToDb": True})
-            params = []
-            for i, it in enumerate(items):
-                qty = _to_int(it.get('quantity') or it.get('qty'), 1)
-                for _ in range(max(1, qty)):
-                    params.append({
-                        'billno': bill_no,
-                        'loc': loc_num,
-                        'flag': 1,
-                    })
-            cur.executemany(f"""
-                INSERT INTO {HOLD_TABLE_NAME} (BILLNO, LOCATIONCODE, FLAG)
-                VALUES (:billno, :loc, :flag)
-            """, params)
-            conn.commit()
+            # If no draft rows existed, insert items with FLAG=0 (held)
+            if updated == 0:
+                params = []
+                for i, it in enumerate(items):
+                    qty = _to_int(it.get('quantity') or it.get('qty'), 1)
+                    for _ in range(max(1, qty)):
+                        params.append({
+                            'billno': bill_no,
+                            'loc': loc_num,
+                            'flag': 0,
+                        })
+                cur.executemany(f"""
+                    INSERT INTO {HOLD_TABLE_NAME} (BILLNO, LOCATIONCODE, FLAG)
+                    VALUES (:billno, :loc, :flag)
+                """, params)
+                conn.commit()
             return jsonify({"ok": True, "billNo": bill_no, "locationCode": location_code, "savedToDb": True})
         except oracledb.Error as e:
             if conn:
@@ -653,14 +862,14 @@ def hold_bill():
 
 
 def _cart_sync_execute(cur, conn, bill_no, location_code, items):
-    """Execute cart sync: delete current bill FLAG=0 rows, then insert items."""
+    """Execute cart sync: delete current bill draft rows (FLAG=1 or NULL), then insert items with FLAG=1 (draft)."""
     loc_num = _location_to_num(location_code, 1)
     bill_no = _to_int(bill_no, 1)
     err_str = None
     try:
         cur.execute(f"""
             DELETE FROM {HOLD_TABLE_NAME}
-            WHERE BILLNO = :billno AND LOCATIONCODE = :loc AND (FLAG = 0 OR FLAG IS NULL)
+            WHERE BILLNO = :billno AND LOCATIONCODE = :loc AND (FLAG = 1 OR FLAG IS NULL)
         """, billno=bill_no, loc=loc_num)
     except oracledb.Error as e:
         err_str = str(e).upper()
@@ -677,7 +886,7 @@ def _cart_sync_execute(cur, conn, bill_no, location_code, items):
                 params_with_flag.append({
                     'billno': bill_no,
                     'loc': loc_num,
-                    'flag': 0,
+                    'flag': 1,
                 })
         try:
             cur.executemany(f"""
@@ -700,7 +909,7 @@ def _cart_sync_execute(cur, conn, bill_no, location_code, items):
 
 @app.route('/api/cart/sync', methods=['GET', 'POST'])
 def cart_sync():
-    """Sync current cart to hold table with FLAG=0 (auto-save when product added to cart). POST only; GET returns hint."""
+    """Sync current cart to hold table with FLAG=1 (draft). POST only; GET returns hint."""
     if request.method == 'GET':
         return jsonify({"ok": True, "message": "Use POST with body: billNo, locationCode, items"}), 200
     data = request.get_json(silent=True) or {}
@@ -755,7 +964,7 @@ def list_held_bills():
             cur.execute(f"""
                 SELECT DISTINCT BILLNO, LOCATIONCODE
                 FROM {HOLD_TABLE_NAME}
-                WHERE LOCATIONCODE = :loc AND FLAG = 1
+                WHERE LOCATIONCODE = :loc AND FLAG = 0
                 ORDER BY BILLNO DESC
             """, loc=loc_num)
             rows = cur.fetchall()
