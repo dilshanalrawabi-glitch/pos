@@ -59,7 +59,6 @@ function PosActionsBar({ cartItems, hasHeldCart, selectedCartItemId, onHold, onH
           title={btn.desc}
           disabled={
             (btn.id === 'hold' && !cartItems?.length) ||
-            (btn.id === 'hold-retrieve' && !hasHeldCart) ||
             (btn.id === 'void-line' && (!cartItems?.length || !selectedCartItemId)) ||
             (btn.id === 'suspend-bill' && !cartItems?.length) ||
             (btn.id === 'qty' && !cartItems?.length)

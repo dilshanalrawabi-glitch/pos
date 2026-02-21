@@ -1,7 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
 import Sidebar from './components/Sidebar'
-import ProductDisplay from './components/ProductDisplay'
-import CartSummary from './components/CartSummary'
 import CustomerList from './components/CustomerList'
 import UserManagement from './components/UserManagement'
 import CounterSetup from './components/CounterSetup'
@@ -29,7 +27,14 @@ if (typeof window !== 'undefined') {
 }
 
 function App() {
-  const [user, setUser] = useState(null)
+  const [user, setUser] = useState(() => {
+    try {
+      const t = localStorage.getItem('pos_token')
+      const u = localStorage.getItem('pos_user')
+      if (t && u) return JSON.parse(u)
+    } catch (_) {}
+    return null
+  })
   const [token, setToken] = useState(() => localStorage.getItem('pos_token') || null)
   const [authLoading, setAuthLoading] = useState(!!localStorage.getItem('pos_token'))
   const [loginError, setLoginError] = useState(null)
@@ -38,6 +43,7 @@ function App() {
   const [cart, setCart] = useState([])
   const [showHoldRetrieveModal, setShowHoldRetrieveModal] = useState(false)
   const [locationCode, setLocationCode] = useState(() => localStorage.getItem('pos_location') || 'LOC001')
+  const [locationName, setLocationName] = useState(() => localStorage.getItem('pos_location_name') || '')
   const [counterCode, setCounterCode] = useState(() => localStorage.getItem('pos_counter_code') || 'CNT01')
   const [counterName, setCounterName] = useState(() => localStorage.getItem('pos_counter_name') || 'Counter 1')
   const [billNo, setBillNo] = useState(() => parseInt(localStorage.getItem('pos_bill_no') || '1', 10))
@@ -57,7 +63,7 @@ function App() {
     }
   }, [])
 
-  // Restore user from token on load
+  // Restore user from token on load (refresh: keep logged in; only relogin on 401)
   useEffect(() => {
     if (!token) {
       setAuthLoading(false)
@@ -66,30 +72,38 @@ function App() {
     fetch(`${API_BASE}/api/me`, {
       headers: { Authorization: `Bearer ${token}` },
     })
-      .then((res) => (res.ok ? res.json() : Promise.reject(res)))
-      .then((data) => setUser(data.user))
-      .catch(() => {
-        localStorage.removeItem('pos_token')
-        setToken(null)
-        setUser(null)
+      .then((res) => {
+        if (res.ok) return res.json()
+        if (res.status === 401) {
+          localStorage.removeItem('pos_token')
+          localStorage.removeItem('pos_user')
+          setToken(null)
+          setUser(null)
+        }
+        return Promise.reject(res)
       })
-      .finally(() => setAuthLoading(false))
-  }, [token])
-
-  // Set bill no to nextBillNo from backend (BILLNOTABLE) when user is logged in
-  useEffect(() => {
-    if (!user) return
-    fetch(`${API_BASE}/api/billno/check`)
-      .then((res) => res.json())
       .then((data) => {
-        if (data.ok && data.nextBillNo != null) {
-          const next = Number(data.nextBillNo)
-          setBillNo(next)
-          localStorage.setItem('pos_bill_no', String(next))
+        if (data?.user) {
+          setUser(data.user)
+          localStorage.setItem('pos_user', JSON.stringify(data.user))
         }
       })
       .catch(() => {})
-  }, [user])
+      .finally(() => setAuthLoading(false))
+  }, [token])
+
+  // Role-based view access: IT=all, Supervisor=Billing+CounterOpen, Cashier=Billing only
+  const getAllowedViews = (r) => {
+    const role = (r || '').toLowerCase()
+    if (role === 'it' || role === 'manager' || role === 'admin') return ['dashboard', 'customers', 'counter-setup', 'counter-open', 'users', 'settings']
+    if (role === 'supervisor') return ['dashboard', 'counter-open']
+    return ['dashboard']
+  }
+  useEffect(() => {
+    if (!user) return
+    const allowed = getAllowedViews(user.role)
+    if (!allowed.includes(activeView)) setActiveView('dashboard')
+  }, [user?.role, activeView])
 
   const handleLogin = async ({ username, password }) => {
     setLoginError(null)
@@ -105,6 +119,18 @@ function App() {
       localStorage.setItem('pos_token', data.token)
       setToken(data.token)
       setUser(data.user)
+      localStorage.setItem('pos_user', JSON.stringify(data.user))
+      // Set location from LOCATIONMASTER (BASELOCATIONFLAG = Y) returned at login
+      if (data.location) {
+        const code = data.location.locationCode ?? data.location.location_code ?? ''
+        const name = data.location.locationName ?? data.location.location_name ?? ''
+        setLocationCode(code || locationCode)
+        setLocationName(name)
+        if (code) localStorage.setItem('pos_location', code)
+        if (name) localStorage.setItem('pos_location_name', name)
+      }
+      // Create and insert new_billno only on actual login (not on refresh)
+      await fetchAndSetNextBillNo()
     } catch (err) {
       setLoginError(err.message || 'Invalid username or password')
     } finally {
@@ -114,6 +140,7 @@ function App() {
 
   const handleLogout = () => {
     localStorage.removeItem('pos_token')
+    localStorage.removeItem('pos_user')
     setToken(null)
     setUser(null)
     setCart([])
@@ -124,7 +151,7 @@ function App() {
       const res = await fetch(`${API_BASE}/api/billno/next`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ flag: 0 }),
+        body: JSON.stringify({ flag: 0, counterCode: counterCode || '' }),
       })
       const data = await res.json().catch(() => ({}))
       if (res.ok && data.billNo != null) {
@@ -235,7 +262,8 @@ function App() {
           price: parseFloat(p.RETAILPRICE) || 0,
           category: p.CATEGORYCODE,
           image: '📦',
-          manufactureId: p.MANUFACTUREID ?? p.manufactureid ?? ''
+          manufactureId: p.MANUFACTUREID ?? p.manufactureid ?? '',
+          alternateCodes: Array.isArray(p.ALTERNATECODES) ? p.ALTERNATECODES : [],
         }))
         setProducts(mappedProducts)
       })
@@ -322,6 +350,34 @@ function App() {
   }
 
   const completePayment = async () => {
+    const activeItems = cart.filter((item) => !item.void)
+    const billdtlPayload = {
+      locationCode: locationCode || '',
+      billNo,
+      items: activeItems.map((item) => ({
+        itemCode: getItemId(item) || String(item.id ?? item.ITEMCODE ?? item.itemCode ?? ''),
+        quantity: Number(item.quantity) || 0,
+        rate: Number(item.price) || 0,
+      })),
+    }
+    try {
+      const res = await fetch(`${API_BASE}/api/billdtl/insert`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(billdtlPayload),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok || !data.ok) console.error('[BILLDTL] insert failed:', data.error || res.status)
+    } catch (e) {
+      console.error('[BILLDTL] insert error:', e)
+    }
+    try {
+      await fetch(`${API_BASE}/api/billno/paid`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ billNo }),
+      })
+    } catch (_) { /* ignore */ }
     clearCart()
     setSelectedCartItemId(null)
     await fetchAndSetNextBillNo()
@@ -332,8 +388,7 @@ function App() {
     setShowPaymentPage(false)
   }
 
-  const showProducts = activeView === 'items'
-  const showDashboard = activeView === 'dashboard' || activeView === 'dashboard'
+  const showBilling = activeView === 'dashboard'
 
   if (authLoading) {
     return (
@@ -355,6 +410,8 @@ function App() {
 
   const roleLabel = user.role ? user.role.charAt(0).toUpperCase() + user.role.slice(1) : ''
   const displayName = user.userid ?? user.username ?? ''
+  const allowedViews = getAllowedViews(user.role)
+  const canView = (id) => allowedViews.includes(id)
   const handleMenuSelect = (id) => {
     setActiveView(id)
     setSidebarOpen(false)
@@ -387,7 +444,8 @@ function App() {
           </button>
           <h1>POS System</h1>
           <div className="header-pos-info">
-            <span>Location: {locationCode}</span>
+            <span>Location code: {locationCode}</span>
+            <span>Location name: {locationName}</span>
             <span>Bill date: {new Date().toLocaleDateString('en-GB', { day: '2-digit', month: '2-digit', year: 'numeric' }).replace(/\//g, '-')}</span>
             <span>Counter: {counterCode} {counterName}</span>
           </div>
@@ -409,34 +467,7 @@ function App() {
             />
           ) : (
             <>
-              {showProducts && (
-                <>
-                  <ProductDisplay
-                    products={products}
-                    onAddToCart={addToCart}
-                    cartItems={cart}
-                    apiBase={API_BASE}
-                    onHold={handleHold}
-                    onHoldRetrieve={handleHoldRetrieve}
-                    hasHeldCart={true}
-                  />
-                  <CartSummary
-                    cartItems={cart}
-                    customers={customers}
-                    selectedCustomer={selectedCustomer}
-                    onClearCustomer={handleClearCustomer}
-                    onUpdateQuantity={updateQuantity}
-                    onRemove={removeFromCart}
-                    onClear={clearCart}
-                    onCheckout={goToPayment}
-                    billNo={billNo}
-                    products={products}
-                    onAddToCart={addToCart}
-                    apiBase={API_BASE}
-                  />
-                </>
-              )}
-              {showDashboard && (
+              {showBilling && (
                 <Dashboard
                   cartItems={cart}
                   products={products}
@@ -463,39 +494,33 @@ function App() {
                   billNo={billNo}
                 />
               )}
+              {activeView === 'customers' && canView('customers') && (
+                <CustomerList customers={customers} />
+              )}
+              {activeView === 'users' && canView('users') && (
+                <UserManagement apiBase={API_BASE} token={token} />
+              )}
+              {activeView === 'counter-setup' && canView('counter-setup') && (
+                <CounterSetup
+                  counterCode={counterCode}
+                  counterName={counterName}
+                  apiBase={API_BASE}
+                  onSave={(code, name) => {
+                    setCounterCode(code)
+                    setCounterName(name)
+                  }}
+                />
+              )}
+              {activeView === 'counter-open' && canView('counter-open') && (
+                <CounterOpen apiBase={API_BASE} token={token} locationCode={locationCode} />
+              )}
+              {activeView === 'settings' && canView('settings') && (
+                <div className="content-placeholder">
+                  <h2>Settings</h2>
+                  <p>Store and tax settings</p>
+                </div>
+              )}
             </>
-          )}
-          {activeView === 'customers' && (
-            <CustomerList customers={customers} />
-          )}
-          {activeView === 'users' && (
-            <UserManagement apiBase={API_BASE} token={token} />
-          )}
-          {activeView === 'counter-setup' && (
-            <CounterSetup
-              counterCode={counterCode}
-              counterName={counterName}
-              apiBase={API_BASE}
-              onSave={(code, name) => {
-                setCounterCode(code)
-                setCounterName(name)
-              }}
-            />
-          )}
-          {activeView === 'counter-open' && (
-            <CounterOpen apiBase={API_BASE} />
-          )}
-          {activeView === 'orders' && (
-            <div className="content-placeholder">
-              <h2>Orders</h2>
-              <p>Track and manage orders</p>
-            </div>
-          )}
-          {activeView === 'settings' && (
-            <div className="content-placeholder">
-              <h2>Settings</h2>
-              <p>Store and tax settings</p>
-            </div>
           )}
         </div>
       </div>

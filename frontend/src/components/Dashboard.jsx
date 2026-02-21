@@ -224,9 +224,6 @@ function Dashboard({
         <section className="dashboard-cart-section">
           <CartSummary
             cartItems={cartItems}
-            customers={customers}
-            selectedCustomer={selectedCustomer}
-            onClearCustomer={onClearCustomer}
             onUpdateQuantity={onUpdateQuantity}
             onRemove={onRemove}
             onClear={onClear}

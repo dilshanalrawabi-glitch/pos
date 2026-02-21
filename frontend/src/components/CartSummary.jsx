@@ -7,9 +7,6 @@ function getItemId(item) {
 
 function CartSummary({
   cartItems,
-  customers = [],
-  selectedCustomer,
-  onClearCustomer,
   onUpdateQuantity,
   onRemove,
   onClear,
@@ -28,15 +25,6 @@ function CartSummary({
   const activeItems = cartItems.filter(item => !item.void)
   const total = activeItems.reduce((sum, item) => sum + (item.price * item.quantity), 0)
   const itemCount = activeItems.reduce((sum, item) => sum + item.quantity, 0)
-
-  const getCustomerName = (c) => {
-    if (!c) return ''
-    const full = c.CUST_FULL_NAME || c.cust_full_name
-    if (full) return String(full).trim()
-    const code = String(c.CUSTOMERCODE || c.customercode || '').trim()
-    const name = String(c.CUSTOMERNAME || c.customername || '').trim()
-    return [code, name].filter(Boolean).join(' ')
-  }
 
   useEffect(() => {
     if (!scanMsg) return
@@ -72,7 +60,8 @@ function CartSummary({
       product = (products || []).find(
         (p) =>
           String(p.manufactureId ?? '').trim() === code ||
-          String(p.id ?? '').trim() === code
+          String(p.id ?? '').trim() === code ||
+          (Array.isArray(p.alternateCodes) && p.alternateCodes.some((alt) => String(alt ?? '').trim() === code))
       )
     }
     if (product) {
@@ -113,23 +102,6 @@ function CartSummary({
           {scanMsg && <span className="cart-scan-msg">{scanMsg}</span>}
         </form>
       </div>
-      {selectedCustomer && (
-        <div className="cart-customer">
-          <span className="cart-customer-label">Customer</span>
-          <div className="cart-customer-selected">
-            <span className="cart-customer-name">{getCustomerName(selectedCustomer)}</span>
-            <button
-              type="button"
-              className="cart-customer-clear"
-              onClick={onClearCustomer}
-              title="Clear customer"
-              aria-label="Clear customer"
-            >
-              ×
-            </button>
-          </div>
-        </div>
-      )}
 
       <div className="cart-items">
         {cartItems.length === 0 ? (

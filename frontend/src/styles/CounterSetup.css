@@ -1,12 +1,21 @@
 .counter-setup {
   flex: 1;
-  background: white;
-  border-radius: 8px;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
-  padding: 24px;
   display: flex;
   flex-direction: column;
+  align-items: center;
   overflow: auto;
+  padding: 24px 16px;
+}
+
+.counter-setup-inner {
+  width: 100%;
+  max-width: 480px;
+  background: white;
+  border-radius: 12px;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.08);
+  padding: 32px;
+  display: flex;
+  flex-direction: column;
 }
 
 .counter-setup-header {
@@ -65,11 +74,12 @@
 }
 
 .counter-setup-input {
+  width: 100%;
+  box-sizing: border-box;
   padding: 10px 14px;
   border: 1px solid #e2e8f0;
   border-radius: 8px;
   font-size: 14px;
-  max-width: 320px;
   background: #f8fafc;
   color: #1e293b;
 }
@@ -113,6 +123,26 @@
 
 .counter-setup-save-btn:hover {
   opacity: 0.9;
+}
+
+.counter-open-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.counter-close-btn {
+  background: linear-gradient(135deg, #b91c1c 0%, #991b1b 100%);
+}
+
+.counter-setup-secondary {
+  background: #e2e8f0;
+  color: #334155;
+}
+
+.counter-setup-secondary:hover {
+  background: #cbd5e1;
 }
 
 .counter-setup-saved-msg {
@@ -161,4 +191,15 @@
 
 .counter-setup-table tbody tr:hover {
   background: #f0fdfa;
+}
+
+/* Counter Open: main card with border and box shadow */
+.counter-open-card {
+  width: 100%;
+  max-width: 560px;
+  background: white;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.08), 0 4px 24px rgba(0, 0, 0, 0.04);
+  padding: 28px;
 }

@@ -40,8 +40,8 @@ function ProductDisplay({ products, onAddToCart, cartItems, onPosAction, onHold,
     if (apiBase) {
       try {
         const res = await fetch(`${apiBase}/api/products/lookup?code=${encodeURIComponent(code)}`)
-        if (res.ok) {
-          const data = await res.json()
+        const data = await res.json().catch(() => ({}))
+        if (res.ok && data.found !== false && (data.ITEMCODE != null || data.itemcode != null)) {
           product = mapLookupToProduct(data)
         }
       } catch (err) {
@@ -52,7 +52,8 @@ function ProductDisplay({ products, onAddToCart, cartItems, onPosAction, onHold,
       product = products.find(
         (p) =>
           String(p.manufactureId ?? '').trim() === code ||
-          String(p.id ?? '').trim() === code
+          String(p.id ?? '').trim() === code ||
+          (Array.isArray(p.alternateCodes) && p.alternateCodes.some((alt) => String(alt ?? '').trim() === code))
       )
     }
     if (product) {
