@@ -291,12 +291,12 @@
 
 .cart-items-header {
   display: grid;
-  grid-template-columns: 36px 1fr 80px 72px 80px;
-  gap: 8px;
+  grid-template-columns: 28px 72px minmax(0, 1fr) 44px 44px 58px 56px 64px;
+  gap: 6px;
   padding: 10px 12px;
   background: #0f766e;
   color: white;
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.04em;
@@ -308,11 +308,14 @@
   text-overflow: ellipsis;
 }
 
-.cart-th-sno { text-align: center; }
+.cart-th-sl { text-align: center; }
+.cart-th-barcode { min-width: 0; }
 .cart-th-name { min-width: 0; }
+.cart-th-uom { text-align: center; }
 .cart-th-qty { text-align: center; }
 .cart-th-price { text-align: right; }
-.cart-th-total { text-align: right; }
+.cart-th-discount { text-align: right; }
+.cart-th-amount { text-align: right; }
 
 .cart-items-list {
   flex: 1;
@@ -323,11 +326,11 @@
 
 .cart-item-row {
   display: grid;
-  grid-template-columns: 36px 1fr 80px 72px 80px;
-  gap: 8px;
+  grid-template-columns: 28px 72px minmax(0, 1fr) 44px 44px 58px 56px 64px;
+  gap: 6px;
   align-items: center;
   padding: 8px 12px;
-  font-size: 13px;
+  font-size: 12px;
   border-bottom: 1px solid #f1f5f9;
   background: #fff;
   min-height: 44px;
@@ -387,10 +390,35 @@
   text-overflow: ellipsis;
 }
 
-.cart-td-sno {
+.cart-td-sl {
   text-align: center;
   color: #64748b;
   font-weight: 600;
+}
+
+.cart-td-barcode {
+  font-size: 11px;
+  color: #64748b;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cart-td-uom {
+  text-align: center;
+  font-size: 11px;
+  color: #64748b;
+}
+
+.cart-td-discount {
+  text-align: right;
+  font-size: 11px;
+  color: #b45309;
+}
+
+.cart-td-amount {
+  text-align: right;
+  font-weight: 700;
+  color: #0f766e;
 }
 
 .cart-td-name {

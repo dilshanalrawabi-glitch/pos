@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import '../styles/CounterSetup.css'
 
-function CounterSetup({ counterCode, counterName, apiBase, onSave }) {
+function CounterSetup({ counterCode, counterName, locationCode, apiBase, onSave }) {
   const [systemName, setSystemName] = useState('')
   const [ipAddress, setIpAddress] = useState('')
   const [code, setCode] = useState('')
@@ -89,7 +89,8 @@ function CounterSetup({ counterCode, counterName, apiBase, onSave }) {
           systemName: (systemName || '').trim(),
           systemIp: (ipAddress || '').trim(),
           counterCode: trimmedCode,
-          counterName: trimmedName
+          counterName: trimmedName,
+          locationCode: (locationCode ?? '').toString().trim() || undefined
         })
       }).catch(() => {})
     }

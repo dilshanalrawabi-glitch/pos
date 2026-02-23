@@ -17,6 +17,7 @@ function mapLookupToProduct(p) {
     category: p.CATEGORYCODE,
     image: '📦',
     manufactureId: (p.MANUFACTUREID ?? p.manufactureid ?? p.ITEMCODE ?? '').toString().trim(),
+    uom: (p.BASEUOM ?? p.baseuom ?? '').toString().trim() || undefined,
   }
 }
 

@@ -20,7 +20,6 @@ if (typeof window !== 'undefined') {
   if (systemName != null || ip != null) {
     if (systemName != null) sessionStorage.setItem('pos_system_name', systemName)
     if (ip != null) sessionStorage.setItem('pos_system_ip', ip)
-    sessionStorage.setItem('pos_show_launcher_popup', '1')
     const cleanUrl = window.location.origin + window.location.pathname + (window.location.hash || '')
     window.history.replaceState({}, document.title, cleanUrl)
   }
@@ -52,16 +51,6 @@ function App() {
   const [selectedCustomer, setSelectedCustomer] = useState(null)
   const [showPaymentPage, setShowPaymentPage] = useState(false)
   const [selectedCartItemId, setSelectedCartItemId] = useState(null)
-  const [showLauncherPopup, setShowLauncherPopup] = useState(false)
-
-  // Show launcher popup (name + IP) when opened via POS Launcher exe
-  useEffect(() => {
-    if (typeof window === 'undefined') return
-    if (sessionStorage.getItem('pos_show_launcher_popup') === '1') {
-      sessionStorage.removeItem('pos_show_launcher_popup')
-      setShowLauncherPopup(true)
-    }
-  }, [])
 
   // Restore user from token on load (refresh: keep logged in; only relogin on 401)
   useEffect(() => {
@@ -131,6 +120,8 @@ function App() {
       }
       // Create and insert new_billno only on actual login (not on refresh)
       await fetchAndSetNextBillNo()
+      // New bill on login: clear cart so it matches the new billNo (cart is per bill)
+      setCart([])
     } catch (err) {
       setLoginError(err.message || 'Invalid username or password')
     } finally {
@@ -264,6 +255,7 @@ function App() {
           image: '📦',
           manufactureId: p.MANUFACTUREID ?? p.manufactureid ?? '',
           alternateCodes: Array.isArray(p.ALTERNATECODES) ? p.ALTERNATECODES : [],
+          uom: (p.BASEUOM ?? p.baseuom ?? '').toString().trim() || undefined,
         }))
         setProducts(mappedProducts)
       })
@@ -277,6 +269,19 @@ function App() {
       .then(data => setCustomers(Array.isArray(data) ? data : []))
       .catch(() => setCustomers([]))
   }, [user])
+
+  // On load / reopen: restore cart from DB (TEMPBILLDTL) by current billNo; when billNo changes, cart must match that bill
+  useEffect(() => {
+    if (!user || billNo == null) return
+    const params = new URLSearchParams({ billNo: String(billNo), locationCode: locationCode || '' })
+    fetch(`${API_BASE}/api/cart/by-bill?${params}`)
+      .then(res => res.json())
+      .then(data => {
+        const list = data?.items
+        setCart(Array.isArray(list) ? list : [])
+      })
+      .catch(() => setCart([]))
+  }, [user, billNo])
 
   const syncCartToDb = (cartItems) => {
     fetch(`${API_BASE}/api/cart/sync`, {
@@ -338,6 +343,11 @@ function App() {
   }
 
   const handleSelectCustomer = (customer) => {
+    const flag = (customer?.FLAG ?? customer?.flag ?? '').toString().trim().toUpperCase()
+    if (flag === 'N') {
+      alert('Customer Locked Please contact Accounts')
+      return
+    }
     setSelectedCustomer(customer)
   }
 
@@ -351,9 +361,12 @@ function App() {
 
   const completePayment = async () => {
     const activeItems = cart.filter((item) => !item.void)
+    const invoiceCode = selectedCustomer?.INVOICECODE ?? selectedCustomer?.invoicecode ?? null
     const billdtlPayload = {
       locationCode: locationCode || '',
       billNo,
+      counterCode: counterCode || '',
+      invoiceCode: invoiceCode != null ? invoiceCode : undefined,
       items: activeItems.map((item) => ({
         itemCode: getItemId(item) || String(item.id ?? item.ITEMCODE ?? item.itemCode ?? ''),
         quantity: Number(item.quantity) || 0,
@@ -504,6 +517,7 @@ function App() {
                 <CounterSetup
                   counterCode={counterCode}
                   counterName={counterName}
+                  locationCode={locationCode}
                   apiBase={API_BASE}
                   onSave={(code, name) => {
                     setCounterCode(code)
@@ -531,28 +545,6 @@ function App() {
         apiBase={API_BASE}
         onRetrieve={handleHoldRetrieveSelect}
       />
-      {showLauncherPopup && (
-        <div className="launcher-popup-overlay" onClick={() => setShowLauncherPopup(false)}>
-          <div className="launcher-popup" onClick={(e) => e.stopPropagation()}>
-            <h3 className="launcher-popup-title">System info</h3>
-            <div className="launcher-popup-row">
-              <span className="launcher-popup-label">Name:</span>
-              <span className="launcher-popup-value">
-                {typeof window !== 'undefined' ? sessionStorage.getItem('pos_system_name') || '—' : '—'}
-              </span>
-            </div>
-            <div className="launcher-popup-row">
-              <span className="launcher-popup-label">IP:</span>
-              <span className="launcher-popup-value">
-                {typeof window !== 'undefined' ? sessionStorage.getItem('pos_system_ip') || '—' : '—'}
-              </span>
-            </div>
-            <button type="button" className="launcher-popup-ok" onClick={() => setShowLauncherPopup(false)}>
-              OK
-            </button>
-          </div>
-        </div>
-      )}
     </div>
   )
 }

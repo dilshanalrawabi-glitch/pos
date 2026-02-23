@@ -1,39 +1,35 @@
-# POS Launcher (exe)
+# POS Launcher
 
-This launcher gets the **system (computer) name** and **local IP address**, then opens the POS web app in the default browser and passes those values in the URL. The web app stores them in **sessionStorage** (`pos_system_name`, `pos_system_ip`).
+Opens the POS web app in your browser with **system name** and **IP** in the URL (stored in sessionStorage for Counter Setup).
 
-## Run without building exe
+## How to open / run
 
+### Option 1: Double-click (File Explorer)
+- In **File Explorer**, go to your project folder → **launcher**
+- Double-click **run_launcher.bat**  
+  (Or double-click **pos_launcher.py** if Python is set to run .py files.)
+
+### Option 2: Terminal / CMD
 ```bash
 cd launcher
 python pos_launcher.py
 ```
 
-## Build exe
+### Option 3: From project root
+```bash
+python launcher/pos_launcher.py
+```
 
-1. Open a terminal in the `launcher` folder.
-2. Run:
-   ```bash
-   build_exe.bat
-   ```
-   Or manually:
-   ```bash
-   python -m pip install pyinstaller
-   pyinstaller --onefile --name POSLauncher --clean pos_launcher.py
-   ```
-3. The executable is created at `launcher\dist\POSLauncher.exe`.
-
-## Change the web app URL
-
-- Default: `http://localhost:5173`
-- Set environment variable before running:
+### In Cursor: Go to File
+- Press **Ctrl+P** (or **Ctrl+E**), type `launcher` or `pos_launcher`
+- Open **launcher/pos_launcher.py**
+- To **run** it: right-click in the editor → **Run Python File in Terminal**, or open the terminal and run:
   ```bash
-  set POS_APP_URL=http://192.168.1.100:5173
-  python pos_launcher.py
+  python launcher/pos_launcher.py
   ```
-- For the exe, set `POS_APP_URL` in the environment where you run `POSLauncher.exe`, or edit `DEFAULT_APP_URL` in `pos_launcher.py` and rebuild.
 
-## In the web app
+## Requirements
+- Python 3
+- POS frontend running (e.g. `npm run dev` on http://localhost:5173)
 
-- **sessionStorage** keys: `pos_system_name`, `pos_system_ip`
-- Read them anywhere: `sessionStorage.getItem('pos_system_name')`, `sessionStorage.getItem('pos_system_ip')`
+To use a different URL set: `POS_APP_URL=http://yourserver:port` before running.

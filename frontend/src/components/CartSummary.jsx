@@ -50,6 +50,7 @@ function CartSummary({
             category: data.CATEGORYCODE ?? data.categorycode,
             image: '📦',
             manufactureId: (data.MANUFACTUREID ?? data.manufactureid ?? data.ITEMCODE ?? data.itemcode ?? '').toString().trim(),
+            uom: (data.BASEUOM ?? data.baseuom ?? '').toString().trim() || undefined,
           }
         }
       } catch (err) {
@@ -112,17 +113,24 @@ function CartSummary({
         ) : (
           <>
             <div className="cart-items-header">
-              <span className="cart-th cart-th-sno">Sl No</span>
-              <span className="cart-th cart-th-name">Name</span>
+              <span className="cart-th cart-th-sl">Sl</span>
+              <span className="cart-th cart-th-barcode">Barcode</span>
+              <span className="cart-th cart-th-name">Item Name</span>
+              <span className="cart-th cart-th-uom">UOM</span>
               <span className="cart-th cart-th-qty">Qty</span>
               <span className="cart-th cart-th-price">Price</span>
-              <span className="cart-th cart-th-total">Total</span>
+              <span className="cart-th cart-th-discount">Discount</span>
+              <span className="cart-th cart-th-amount">Amount</span>
             </div>
             <div className="cart-items-list">
               {cartItems.map((item, index) => {
                 const id = getItemId(item)
                 const isSelected = selectedItemId != null && String(id) === String(selectedItemId)
                 const isVoid = !!item.void
+                const barcode = item.manufactureId ?? item.MANUFACTURERID ?? item.manufacturerId ?? ''
+                const uom = item.uom ?? item.UOM ?? item.unit ?? '—'
+                const discount = Number(item.discount) || 0
+                const lineTotal = item.price * item.quantity - discount
                 return (
                   <div
                     key={id || index}
@@ -139,14 +147,17 @@ function CartSummary({
                     aria-pressed={isSelected}
                     aria-label={isVoid ? `${item.name} (void)` : item.name}
                   >
-                    <span className="cart-td cart-td-sno">{index + 1}</span>
+                    <span className="cart-td cart-td-sl">{index + 1}</span>
+                    <span className="cart-td cart-td-barcode" title={barcode}>{barcode || '—'}</span>
                     <span className="cart-td cart-td-name" title={item.name}>
                       {item.name}
                       {isVoid && <span className="cart-item-void-badge">VOID</span>}
                     </span>
+                    <span className="cart-td cart-td-uom">{uom}</span>
                     <span className="cart-td cart-td-qty">{item.quantity}</span>
-                    <span className="cart-td cart-td-price">QAR {item.price.toFixed(2)}</span>
-                    <span className="cart-td cart-td-total">QAR {(item.price * item.quantity).toFixed(2)}</span>
+                    <span className="cart-td cart-td-price">{item.price.toFixed(2)}</span>
+                    <span className="cart-td cart-td-discount">{discount > 0 ? `${discount.toFixed(2)}` : '—'}</span>
+                    <span className="cart-td cart-td-amount">{lineTotal.toFixed(2)}</span>
                   </div>
                 )
               })}
