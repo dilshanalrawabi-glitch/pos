@@ -1,0 +1,442 @@
+.counter-setup {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  overflow: auto;
+  padding: 24px 16px;
+}
+
+.counter-setup-inner {
+  width: 100%;
+  max-width: 480px;
+  background: white;
+  border-radius: 12px;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.08);
+  padding: 32px;
+  display: flex;
+  flex-direction: column;
+}
+
+
+
+.counter-setup-header h2 {
+  margin: 0 0 16px 0;
+  font-size: 22px;
+  color: #1e293b;
+}
+
+.counter-setup-form {
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+}
+
+.counter-setup-section {
+  padding-bottom: 20px;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+.counter-setup-section:last-of-type {
+  border-bottom: none;
+}
+
+.counter-setup-section h3 {
+  margin: 0 0 12px 0;
+  font-size: 16px;
+  font-weight: 600;
+  color: #0f766e;
+}
+
+.counter-setup-row {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.counter-setup-row:last-child {
+  margin-bottom: 0;
+}
+
+.counter-setup-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: #475569;
+}
+
+.counter-setup-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 10px 14px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  font-size: 14px;
+  background: #f8fafc;
+  color: #1e293b;
+}
+
+.counter-setup-input:focus {
+  outline: none;
+  border-color: #0f766e;
+  box-shadow: 0 0 0 3px rgba(15, 118, 110, 0.15);
+  background: white;
+}
+
+.counter-setup-input.counter-setup-readonly {
+  background: #f1f5f9;
+  color: #64748b;
+  cursor: default;
+}
+
+.counter-setup-code-loading {
+  font-size: 14px;
+  color: #94a3b8;
+}
+
+.counter-setup-actions {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.counter-setup-save-btn {
+  padding: 12px 24px;
+  background: linear-gradient(135deg, #0f766e 0%, #134e4a 100%);
+  color: white;
+  border: none;
+  border-radius: 8px;
+  font-weight: 600;
+  font-size: 14px;
+  cursor: pointer;
+  transition: opacity 0.2s;
+}
+
+.counter-setup-save-btn:hover {
+  opacity: 0.9;
+}
+
+.counter-open-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.counter-close-btn {
+  background: linear-gradient(135deg, #b91c1c 0%, #991b1b 100%);
+}
+
+.counter-close-report {
+  margin-top: 16px;
+  padding: 14px 16px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+}
+
+.counter-close-report-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.counter-close-report-head .counter-close-report-title {
+  margin: 0;
+}
+
+.counter-close-report-title {
+  margin: 0 0 10px;
+  font-size: 15px;
+  font-weight: 600;
+  color: #334155;
+}
+
+.counter-close-report-meta {
+  margin: 0 0 12px;
+  font-size: 12px;
+  color: #64748b;
+  line-height: 1.4;
+}
+
+.counter-close-report-warn {
+  font-size: 12px;
+  font-weight: 500;
+  color: #b45309;
+}
+
+.counter-close-report-grid {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px 20px;
+  margin: 0;
+  font-size: 14px;
+  color: #475569;
+}
+
+.counter-close-report-grid dt {
+  margin: 0;
+  font-weight: 500;
+}
+
+.counter-close-report-grid dd {
+  margin: 0;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.counter-setup-secondary {
+  background: #e2e8f0;
+  color: #334155;
+}
+
+.counter-setup-secondary:hover {
+  background: #cbd5e1;
+}
+
+.counter-setup-saved-msg {
+  font-size: 14px;
+  color: #0f766e;
+  font-weight: 500;
+}
+
+.counter-setup-list {
+  margin-bottom: 24px;
+}
+
+.counter-setup-muted {
+  margin: 0;
+  font-size: 14px;
+  color: #94a3b8;
+}
+
+.counter-setup-table-wrap {
+  overflow-x: auto;
+  margin-top: 8px;
+}
+
+.counter-setup-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.counter-setup-table th,
+.counter-setup-table td {
+  padding: 8px 12px;
+  text-align: left;
+  border: 1px solid #e2e8f0;
+}
+
+.counter-setup-table th {
+  background: #0f766e;
+  color: white;
+  font-weight: 600;
+}
+
+.counter-setup-table tbody tr:nth-child(even) {
+  background: #f8fafc;
+}
+
+.counter-setup-table tbody tr:hover {
+  background: #f0fdfa;
+}
+
+/* Counter Open: main card with border and box shadow */
+.counter-open-card {
+  width: 100%;
+  max-width: 560px;
+  background: white;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.08), 0 4px 24px rgba(0, 0, 0, 0.04);
+  padding: 28px;
+}
+
+/* Counter close confirmation modal (matches Hold Retrieve overlay pattern) */
+.counter-close-confirm-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10050;
+  padding: 16px;
+  box-sizing: border-box;
+}
+
+body.keyboard-open .counter-close-confirm-overlay {
+  align-items: flex-start;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: var(--keyboard-height, 320px);
+  padding-top: max(12px, env(safe-area-inset-top, 0px));
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+body.keyboard-open .counter-close-confirm-modal {
+  max-height: min(85vh, calc(100vh - var(--keyboard-height, 320px) - 32px));
+}
+
+.counter-close-confirm-modal {
+  background: #fff;
+  border-radius: 12px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.18), 0 2px 8px rgba(0, 0, 0, 0.06);
+  width: 100%;
+  max-width: 420px;
+  max-height: min(90vh, 560px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid #e2e8f0;
+}
+
+.counter-close-confirm-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 18px;
+  border-bottom: 1px solid #e2e8f0;
+  background: linear-gradient(180deg, #f8fafc 0%, #fff 100%);
+}
+
+.counter-close-confirm-header h3 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.counter-close-confirm-close {
+  background: none;
+  border: none;
+  font-size: 24px;
+  line-height: 1;
+  color: #64748b;
+  cursor: pointer;
+  padding: 0 4px;
+  border-radius: 6px;
+}
+
+.counter-close-confirm-close:hover:not(:disabled) {
+  color: #0f766e;
+  background: #f1f5f9;
+}
+
+.counter-close-confirm-close:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.counter-close-confirm-body {
+  padding: 18px 20px;
+  overflow-y: auto;
+}
+
+.counter-close-confirm-lead {
+  margin: 0 0 14px;
+  font-size: 14px;
+  line-height: 1.5;
+  color: #475569;
+}
+
+.counter-close-confirm-details {
+  margin: 0;
+  padding: 12px 14px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+}
+
+.counter-close-confirm-row {
+  display: grid;
+  grid-template-columns: 120px 1fr;
+  gap: 8px 12px;
+  font-size: 14px;
+  padding: 6px 0;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+.counter-close-confirm-row:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+
+.counter-close-confirm-row:first-child {
+  padding-top: 0;
+}
+
+.counter-close-confirm-row dt {
+  margin: 0;
+  font-weight: 600;
+  color: #64748b;
+}
+
+.counter-close-confirm-row dd {
+  margin: 0;
+  color: #0f172a;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.counter-close-confirm-row-emphasis dd {
+  font-weight: 700;
+  color: #0f766e;
+}
+
+.counter-close-confirm-hint {
+  margin: 14px 0 0;
+  font-size: 12px;
+  color: #94a3b8;
+  line-height: 1.4;
+}
+
+.counter-close-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 14px 18px 18px;
+  border-top: 1px solid #e2e8f0;
+  background: #fafafa;
+}
+
+.counter-close-confirm-btn {
+  padding: 11px 18px;
+  font-size: 14px;
+  font-weight: 600;
+  border-radius: 8px;
+  border: none;
+  cursor: pointer;
+  transition: background 0.15s, opacity 0.15s;
+}
+
+.counter-close-confirm-btn:disabled {
+  opacity: 0.65;
+  cursor: not-allowed;
+}
+
+.counter-close-confirm-btn-secondary {
+  background: #e2e8f0;
+  color: #334155;
+}
+
+.counter-close-confirm-btn-secondary:hover:not(:disabled) {
+  background: #cbd5e1;
+}
+
+.counter-close-confirm-btn-danger {
+  background: linear-gradient(135deg, #b91c1c 0%, #991b1b 100%);
+  color: #fff;
+}
+
+.counter-close-confirm-btn-danger:hover:not(:disabled) {
+  opacity: 0.92;
+}

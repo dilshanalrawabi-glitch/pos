@@ -1,0 +1,91 @@
+.printer-settings {
+  padding: 1rem;
+  max-width: 640px;
+}
+
+.printer-settings h3 {
+  margin: 0 0 0.5rem 0;
+  font-size: 1.1rem;
+}
+
+.printer-settings-desc {
+  margin: 0 0 1rem 0;
+  color: #555;
+  font-size: 0.9rem;
+}
+
+.printer-settings-desc a {
+  color: #0a7ea4;
+}
+
+.printer-settings-loading,
+.printer-settings-empty {
+  color: #666;
+  font-size: 0.9rem;
+}
+
+.printer-settings-error {
+  color: #c00;
+  font-size: 0.9rem;
+}
+
+.printer-settings-error button {
+  margin-left: 0.5rem;
+  padding: 0.25rem 0.5rem;
+  cursor: pointer;
+}
+
+.printer-settings-section {
+  margin-top: 1.5rem;
+}
+
+.printer-settings-label {
+  display: block;
+  margin-top: 0.5rem;
+  font-size: 0.9rem;
+  color: #333;
+}
+
+.printer-settings-input {
+  width: 100%;
+  padding: 0.5rem;
+  margin-top: 0.25rem;
+  font-size: 0.95rem;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  box-sizing: border-box;
+}
+
+.printer-settings-select {
+  width: 100%;
+  padding: 0.5rem;
+  font-size: 0.95rem;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+}
+
+.printer-settings-cert-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin-bottom: 0.5rem;
+}
+
+.printer-settings-cert-btn {
+  padding: 0.5rem 0.85rem;
+  font-size: 0.9rem;
+  cursor: pointer;
+  border: 1px solid #0f766e;
+  border-radius: 6px;
+  background: #f0fdfa;
+  color: #134e4a;
+  font-weight: 500;
+}
+
+.printer-settings-cert-btn:hover {
+  background: #ccfbf1;
+}
+
+.printer-settings-cert-error {
+  margin-bottom: 0.75rem;
+}

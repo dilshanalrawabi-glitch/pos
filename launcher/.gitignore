@@ -1,0 +1,4 @@
+# PyInstaller / exe build outputs (spec files are kept for reproducible builds)
+build/
+dist/
+*.exe

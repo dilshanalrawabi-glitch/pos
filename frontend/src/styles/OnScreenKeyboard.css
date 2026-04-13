@@ -1,0 +1,79 @@
+/* Isolate keyboard from page: no browser gestures, no selection, no context menu */
+.on-screen-keyboard-wrapper {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 9999;
+  background: #ececec;
+  padding: 10px;
+  box-shadow: 0 -4px 20px rgba(0, 0, 0, 0.15);
+  animation: slideUp 0.2s ease-out;
+  touch-action: none;
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  -moz-user-select: none;
+  -ms-user-select: none;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+  isolation: isolate;
+  contain: layout style paint;
+  pointer-events: auto;
+}
+
+.on-screen-keyboard-wrapper * {
+  -webkit-tap-highlight-color: transparent;
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  -moz-user-select: none;
+  -ms-user-select: none;
+  user-select: none;
+  touch-action: none;
+}
+
+@keyframes slideUp {
+  from {
+    transform: translateY(100%);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+.simple-keyboard-container {
+  max-width: 900px;
+  margin: 0 auto;
+}
+
+.simple-keyboard-container .hg-button {
+  font-size: 16px;
+  min-height: 44px;
+  touch-action: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.simple-keyboard-container .hg-button-bksp {
+  min-width: 60px;
+}
+
+.simple-keyboard-container .hg-button-shift {
+  min-width: 50px;
+}
+
+.simple-keyboard-container .hg-button-space {
+  min-width: 120px;
+}
+
+.simple-keyboard-container .hg-button-enter {
+  min-width: 70px;
+}
+
+.simple-keyboard-container button {
+  outline: none;
+}
+
+.simple-keyboard-container button:focus {
+  outline: none;
+}

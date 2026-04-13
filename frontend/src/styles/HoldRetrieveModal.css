@@ -1,0 +1,207 @@
+.hold-retrieve-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* Above on-screen keyboard (9999) so supervisor / hold retrieve always receive taps */
+  z-index: 10050;
+}
+
+/* On-screen keyboard sits at bottom (z-index 9999). Keep dialogs above the keyboard strip and pinned to the top for visibility. */
+body.keyboard-open .hold-retrieve-overlay {
+  align-items: flex-start;
+  justify-content: center;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: var(--keyboard-height, 320px);
+  padding-top: max(12px, env(safe-area-inset-top, 0px));
+  padding-left: 16px;
+  padding-right: 16px;
+  padding-bottom: 12px;
+  box-sizing: border-box;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+body.keyboard-open .hold-retrieve-modal {
+  max-height: min(85vh, calc(100vh - var(--keyboard-height, 320px) - 32px));
+  margin-top: 0;
+}
+
+.hold-retrieve-modal {
+  background: white;
+  border-radius: 12px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.15);
+  min-width: 320px;
+  max-width: 90vw;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.hold-retrieve-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+.hold-retrieve-header h3 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.hold-retrieve-close {
+  background: none;
+  border: none;
+  font-size: 24px;
+  line-height: 1;
+  color: #64748b;
+  cursor: pointer;
+  padding: 0 4px;
+}
+
+.hold-retrieve-close:hover {
+  color: #0f766e;
+}
+
+.hold-retrieve-body {
+  padding: 16px 20px;
+  overflow-y: auto;
+}
+
+.hold-retrieve-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.hold-retrieve-label {
+  font-size: 14px;
+  font-weight: 600;
+  color: #0f172a;
+}
+
+.hold-retrieve-input {
+  width: 100%;
+  padding: 12px 14px;
+  font-size: 16px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  box-sizing: border-box;
+}
+
+.hold-retrieve-input:focus {
+  outline: none;
+  border-color: #0f766e;
+  box-shadow: 0 0 0 2px rgba(15, 118, 110, 0.2);
+}
+
+.hold-retrieve-input::placeholder {
+  color: #94a3b8;
+}
+
+.hold-retrieve-submit {
+  padding: 12px 20px;
+  font-size: 15px;
+  font-weight: 600;
+  color: #fff;
+  background: #0f766e;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.hold-retrieve-submit:hover:not(:disabled) {
+  background: #0d9488;
+}
+
+.hold-retrieve-submit:disabled {
+  opacity: 0.7;
+  cursor: not-allowed;
+}
+
+.hold-retrieve-msg,
+.hold-retrieve-error {
+  margin: 0;
+  padding: 12px 0;
+  font-size: 14px;
+}
+
+.hold-retrieve-error {
+  color: #dc2626;
+}
+
+.hold-retrieve-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.hold-retrieve-item {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  width: 100%;
+  padding: 14px 16px;
+  margin-bottom: 8px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  font-size: 14px;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.hold-retrieve-item-main {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+
+.hold-retrieve-item-details {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-size: 12px;
+  color: #475569;
+  border-top: 1px solid #e2e8f0;
+  padding-top: 8px;
+}
+
+.hold-retrieve-item-details li {
+  padding: 2px 0;
+}
+
+.hold-retrieve-item-price {
+  color: #64748b;
+}
+
+.hold-retrieve-item-more {
+  font-style: italic;
+  color: #94a3b8;
+}
+
+.hold-retrieve-item:hover {
+  background: #f1f5f9;
+  border-color: #0f766e;
+}
+
+.hold-retrieve-billno {
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.hold-retrieve-date {
+  font-size: 12px;
+  color: #64748b;
+}

@@ -1,0 +1,6 @@
+.cloudflared/
+config.yml
+tunnel-state.json
+dns-config.ps1
+# Optional local binary (large); use cloudflared on PATH if absent
+bin/

@@ -1,0 +1,12 @@
+# Copy to config.yml after bootstrap.ps1, or fill tunnel id + credentials path manually.
+# Hostnames come from dns-config.ps1 or bootstrap -FrontendHost / -BackendHost (any Cloudflare zone).
+
+tunnel: YOUR_TUNNEL_UUID
+credentials-file: D:/DiLSHAN/POS-WHOLESALE/cloudflare-tunnel/.cloudflared/YOUR_TUNNEL_UUID.json
+
+ingress:
+  - hostname: pos.your-domain.com
+    service: http://127.0.0.1:7117
+  - hostname: pos-backend.your-domain.com
+    service: http://127.0.0.1:7227
+  - service: http_status:404

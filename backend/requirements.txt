@@ -1,0 +1,8 @@
+Flask
+flask-cors
+python-dotenv
+oracledb
+flask-sqlalchemy
+bcrypt
+PyJWT
+cryptography
