@@ -34,6 +34,8 @@ const FONT_NORMAL = ESC + '\x4D\x00'
 const FONT_SMALL = ESC + '\x4D\x01'
 // ESC t n: Select character table — 0x25 (37) = IBM864 Arabic (Epson)
 const ARABIC_CODEPAGE = ESC + '\x74\x25'
+// After Arabic header, PC437 (table 0) keeps Latin digits/ASCII labels readable on many printers under IBM864 jobs
+const LATIN_CODEPAGE_PC437 = ESC + '\x74\x00'
 const CUT = GS + '\x56\x00' // full cut
 
 const PRINTER_KEY = 'pos_receipt_printer'
@@ -50,12 +52,23 @@ async function ensureQzSecurity(qz) {
     throw new Error('API base URL not configured')
   }
   qz.security.setCertificatePromise((resolve, reject) => {
-    fetch(`${base}/api/qz-tray/certificate`, { cache: 'no-store' })
+    const certUrl = `${base}/api/qz-tray/certificate`
+    fetch(certUrl, { cache: 'no-store' })
       .then((r) => {
-        if (!r.ok) throw new Error(`Certificate: ${r.status}`)
+        if (!r.ok) {
+          throw new Error(
+            `Certificate fetch failed (${certUrl}): ${r.status}. Is the API running and backend/certs/digital-certificate.txt present?`
+          )
+        }
         return r.text()
       })
-      .then(resolve)
+      .then((text) => {
+        if (!text || !text.includes('BEGIN CERTIFICATE')) {
+          reject(new Error(`Invalid certificate from ${certUrl}. Check backend/certs/digital-certificate.txt.`))
+          return
+        }
+        resolve(text)
+      })
       .catch(reject)
   })
   qz.security.setSignatureAlgorithm('SHA512')
@@ -157,13 +170,67 @@ function lineEnArAmount(english, arabic, amountStr) {
 }
 
 /**
- * One line: label left, value right – uses full RECEIPT_WIDTH
+ * Parse a monetary or numeric value from API/localStorage (handles strings, commas).
+ */
+function parseReceiptAmount(v) {
+  if (v == null || v === '') return 0
+  if (typeof v === 'number') return Number.isFinite(v) ? v : 0
+  const s = String(v).trim().replace(/,/g, '')
+  const n = parseFloat(s)
+  return Number.isFinite(n) ? n : 0
+}
+
+/** Two-decimal amount string for thermal lines; never "NaN". */
+function formatReceiptAmount2(v) {
+  const n = Math.round(parseReceiptAmount(v) * 100) / 100
+  return n.toFixed(2)
+}
+
+function _isPlainObject(o) {
+  return Boolean(o) && typeof o === 'object' && !Array.isArray(o)
+}
+
+/**
+ * Merge nested summary objects (some gateways wrap the payload).
+ * Outer envelope last must NOT win over nested totals — use `{ ...data, ...nest }` so
+ * e.g. `{ totalSales: 0, data: { totalSales: 150 } }` resolves to 150.
+ */
+export function mergeCounterCloseSource(data) {
+  if (!data || typeof data !== 'object') return {}
+  const nest =
+    (_isPlainObject(data.summary) && data.summary) ||
+    (_isPlainObject(data.totals) && data.totals) ||
+    (_isPlainObject(data.result) && data.result) ||
+    (_isPlainObject(data.data) && data.data) ||
+    null
+  return nest ? { ...data, ...nest } : { ...data }
+}
+
+/** First present key wins; then parse as money (never NaN). */
+function amountFromRow(row, keys) {
+  if (!row || typeof row !== 'object') return 0
+  for (const k of keys) {
+    if (!Object.prototype.hasOwnProperty.call(row, k)) continue
+    const v = row[k]
+    if (v !== undefined && v !== null && v !== '') return parseReceiptAmount(v)
+  }
+  return 0
+}
+
+/**
+ * One line: label left, value right – uses full RECEIPT_WIDTH.
+ * Value column grows with content (up to max) so amounts are not left-truncated.
  */
 function lineLabelValue(label, value) {
-  const valueStr = String(value)
-  const valueW = 18
-  const labelW = RECEIPT_WIDTH - valueW
-  return pad(label.slice(0, labelW), labelW) + pad(valueStr.slice(-valueW), valueW, 'right') + LF
+  const valueStr = String(value ?? '')
+  const minLabelChars = 8
+  const maxValueW = RECEIPT_WIDTH - minLabelChars
+  const valW = Math.min(Math.max(valueStr.length, 12), maxValueW)
+  const labelW = RECEIPT_WIDTH - valW
+  const labStr = label.slice(0, labelW)
+  const valCell =
+    valueStr.length <= valW ? pad(valueStr, valW, 'right') : pad(valueStr.slice(-valW), valW, 'right')
+  return pad(labStr, labelW) + valCell + LF
 }
 
 /**
@@ -430,52 +497,43 @@ function pushSectionHeading(lines, title) {
  * ESC/POS counter closing slip — layout matches thermal “Counter Closing” report
  */
 export function buildEscPosCounterCloseReport(data, encoding = 'IBM864') {
+  const row = mergeCounterCloseSource(data)
   const {
     date = '',
     counterCode = '',
     locationCode = '',
     locationName = '',
-    totalSales = 0,
-    totalReturns = 0,
-    netTotal = 0,
-    companyName = 'RAWABI FOOD INTERNATIONAL',
-    companyNameAr = '',
     branchName = '',
+    locationTelephone = '',
     closedBy = '',
     cashierDisplay = '',
-    totalCardAmount = 0,
-    /** Sum of CARDAMOUNT on return bills (card refunds); used if cashInBox missing */
-    totalCardReturns = 0,
     cardByType = null,
-    discountTotal = 0,
-    creditTotal = 0,
-    voucherTotal = 0,
     cashInBox = null,
     crReconciled = 0,
     /** 'check' = pre-close time-check copy; 'final' = official slip after Close */
     slipKind = 'final',
-  } = data
+  } = row
+
+  const totalSales = amountFromRow(row, ['totalSales', 'total_sales', 'TOTALSALES'])
+  const totalReturns = amountFromRow(row, ['totalReturns', 'total_returns', 'TOTALRETURNS'])
+  const netTotal = amountFromRow(row, ['netTotal', 'net_total', 'NETTOTAL'])
+  const totalCardAmount = amountFromRow(row, ['totalCardAmount', 'total_card_amount', 'TOTALCARDAMOUNT'])
+  const totalCardReturns = amountFromRow(row, ['totalCardReturns', 'total_card_returns'])
+  const discountTotal = amountFromRow(row, ['discountTotal', 'discount_total', 'DISCOUNTTOTAL'])
+  const creditTotal = amountFromRow(row, ['creditTotal', 'credit_total', 'CREDITTOTAL'])
+  const voucherTotal = amountFromRow(row, ['voucherTotal', 'voucher_total', 'VOUCHERTOTAL'])
+
+  const locationHeading = (branchName || locationName || locationCode || '').trim().slice(0, RECEIPT_WIDTH)
 
   const lines = []
   lines.push(INIT)
   if (encoding === 'IBM864') {
     lines.push(ARABIC_CODEPAGE)
   }
-  lines.push(FONT_SMALL)
-  lines.push(CENTER)
-  if (companyNameAr) {
-    lines.push(companyNameAr.slice(0, RECEIPT_WIDTH) + LF)
+  pushLocationHeaderEscPos(lines, locationHeading, locationTelephone)
+  if (encoding === 'IBM864') {
+    lines.push(LATIN_CODEPAGE_PC437)
   }
-  lines.push(FONT_NORMAL)
-  lines.push(BOLD_ON)
-  lines.push((companyName || 'RAWABI FOOD INTERNATIONAL').slice(0, RECEIPT_WIDTH) + LF)
-  lines.push(BOLD_OFF)
-  lines.push(FONT_SMALL)
-  const locBit = (locationName || locationCode || '').toString().trim()
-  const titleLoc = [companyName, locBit].filter(Boolean).join(' - ')
-  if (titleLoc) lines.push(titleLoc.slice(0, RECEIPT_WIDTH) + LF)
-  if (branchName) lines.push(branchName.slice(0, RECEIPT_WIDTH) + LF)
-  lines.push(dashedLine())
 
   const closeDateStr = formatCounterCloseDate(date)
   const isCheckCopy = slipKind === 'check'
@@ -505,11 +563,11 @@ export function buildEscPosCounterCloseReport(data, encoding = 'IBM864') {
   )
 
   lines.push(LF)
-  lines.push(lineLabelValue('Total Sales', Number(totalSales).toFixed(2)))
-  lines.push(lineLabelValue('Sales returns', Number(totalReturns).toFixed(2)))
-  lines.push(lineLabelValue('Net total', Number(netTotal).toFixed(2)))
-  lines.push(lineLabelValue('Discount (lines)', Number(discountTotal).toFixed(2)))
-  lines.push(lineLabelValue('Credit on account', Number(creditTotal).toFixed(2)))
+  lines.push(lineLabelValue('Total Sales', formatReceiptAmount2(totalSales)))
+  lines.push(lineLabelValue('Sales returns', formatReceiptAmount2(totalReturns)))
+  lines.push(lineLabelValue('Net total', formatReceiptAmount2(netTotal)))
+  lines.push(lineLabelValue('Discount (lines)', formatReceiptAmount2(discountTotal)))
+  lines.push(lineLabelValue('Credit on account', formatReceiptAmount2(creditTotal)))
 
   lines.push(LF)
   pushSectionHeading(lines, 'Card Details')
@@ -517,15 +575,15 @@ export function buildEscPosCounterCloseReport(data, encoding = 'IBM864') {
   const cardKeys = Object.keys(cardMap)
   if (cardKeys.length > 0) {
     cardKeys.sort().forEach((k) => {
-      lines.push(lineLabelValue(k, Number(cardMap[k]).toFixed(2)))
+      lines.push(lineLabelValue(k, formatReceiptAmount2(cardMap[k])))
     })
-  } else if (Number(totalCardAmount) > 0) {
-    lines.push(lineLabelValue('CARD', Number(totalCardAmount).toFixed(2)))
+  } else if (parseReceiptAmount(totalCardAmount) > 0) {
+    lines.push(lineLabelValue('CARD', formatReceiptAmount2(totalCardAmount)))
   }
 
   lines.push(LF)
   pushSectionHeading(lines, 'Gift Voucher Details')
-  lines.push(lineLabelValue('VOUCHER', Number(voucherTotal).toFixed(2)))
+  lines.push(lineLabelValue('VOUCHER', formatReceiptAmount2(voucherTotal)))
 
   lines.push(LF)
   pushSectionHeading(lines, 'Currency Details')
@@ -533,20 +591,25 @@ export function buildEscPosCounterCloseReport(data, encoding = 'IBM864') {
   pushSectionHeading(lines, 'No.Of Telephone Cards')
 
   lines.push(LF)
-  lines.push(lineLabelValue('Cr.Reconcilled', Number(crReconciled).toFixed(2)))
+  lines.push(lineLabelValue('Cr.Reconcilled', formatReceiptAmount2(crReconciled)))
   lines.push(dashedLine())
 
   // Cash in box: from API (per-bill NET-CARD sums minus credit & voucher) or fallback formula
-  const cash =
-    cashInBox != null && !Number.isNaN(Number(cashInBox))
-      ? Number(cashInBox)
-      : Number(netTotal) -
-        Number(totalCardAmount || 0) +
-        Number(totalCardReturns || 0) -
-        Number(creditTotal) -
-        Number(voucherTotal)
+  const cashInBoxStr = cashInBox == null ? '' : String(cashInBox).trim().replace(/,/g, '')
+  const canUseApiCash =
+    cashInBox !== undefined &&
+    cashInBox !== null &&
+    cashInBoxStr !== '' &&
+    Number.isFinite(parseFloat(cashInBoxStr))
+  const cash = canUseApiCash
+    ? parseReceiptAmount(cashInBox)
+    : parseReceiptAmount(netTotal) -
+      parseReceiptAmount(totalCardAmount) +
+      parseReceiptAmount(totalCardReturns) -
+      parseReceiptAmount(creditTotal) -
+      parseReceiptAmount(voucherTotal)
   lines.push(BOLD_ON)
-  lines.push(lineLabelValue('Cash in Box', cash.toFixed(2)))
+  lines.push(lineLabelValue('Cash in Box', formatReceiptAmount2(cash)))
   lines.push(BOLD_OFF)
   lines.push(FONT_SMALL)
   lines.push(

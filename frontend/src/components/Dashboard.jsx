@@ -13,6 +13,10 @@ function todayStr() {
   )
 }
 
+function isIsoDate(s) {
+  return s != null && /^\d{4}-\d{2}-\d{2}$/.test(String(s).trim())
+}
+
 /** Match backend BILLHDR: X = return; legacy negative NET on C/R = return */
 function isBillSalesReturn(row) {
   const bt = String(row?.billType ?? '').toUpperCase()
@@ -27,8 +31,12 @@ export default function Dashboard({
   counterCode = '',
   counterName = '',
   user = null,
+  /** YYYY-MM-DD: counter DATEOFOPEN while session is open (from App). */
+  counterSessionBillDate = '',
 }) {
-  const [billDate, setBillDate] = useState(todayStr)
+  const [billDate, setBillDate] = useState(() =>
+    isIsoDate(counterSessionBillDate) ? String(counterSessionBillDate).trim() : todayStr()
+  )
   const [billNoFilter, setBillNoFilter] = useState('')
   const [bills, setBills] = useState([])
   const [loading, setLoading] = useState(false)
@@ -36,6 +44,12 @@ export default function Dashboard({
   const [printingBillNo, setPrintingBillNo] = useState(null)
   const billNoFilterRef = useRef(billNoFilter)
   billNoFilterRef.current = billNoFilter
+
+  useEffect(() => {
+    if (isIsoDate(counterSessionBillDate)) {
+      setBillDate(String(counterSessionBillDate).trim())
+    }
+  }, [counterSessionBillDate])
 
   const loadBills = useCallback(async (opts = {}) => {
     const { useBillNoServerFilter = false } = opts
@@ -155,11 +169,11 @@ export default function Dashboard({
             />
           </label>
           <label className="dashboard-field dashboard-field-grow">
-            <span>Bill no. (filter)</span>
+            <span>Filter</span>
             <input
               type="text"
               inputMode="numeric"
-              placeholder="Type to narrow list, or full number + Refresh"
+              placeholder="Search bill no"
               value={billNoFilter}
               onChange={(e) => setBillNoFilter(e.target.value)}
             />
@@ -179,35 +193,37 @@ export default function Dashboard({
           <span>Bills on {billDate}</span>
           <span className="dashboard-list-count">{filteredBills.length} shown</span>
         </div>
-        {loading && bills.length === 0 ? (
-          <div className="dashboard-empty">Loading bills…</div>
-        ) : filteredBills.length === 0 ? (
-          <div className="dashboard-empty">No bills for this date{billNoFilter.trim() ? ' (with current filter)' : ''}.</div>
-        ) : (
-          <ul className="dashboard-bill-list">
-            {filteredBills.map((b) => (
-              <li key={`${b.billNo}-${b.billDate}`} className="dashboard-bill-row">
-                <button
-                  type="button"
-                  className="dashboard-bill-no-btn"
-                  disabled={printingBillNo === b.billNo}
-                  onClick={() => handlePrintBill(b)}
-                  title="Print receipt"
-                >
-                  {printingBillNo === b.billNo ? 'Printing…' : `Bill ${b.billNo}`}
-                </button>
-                <span className="dashboard-bill-meta">{b.counterCode || '—'}</span>
-                <span className="dashboard-bill-meta">{b.customerName || '—'}</span>
-                <span className="dashboard-bill-amount">
-                  QAR {Number(b.netBillAmount || 0).toFixed(2)}
-                </span>
-                <span className={`dashboard-bill-type ${isBillSalesReturn(b) ? 'return' : ''}`}>
-                  {isBillSalesReturn(b) ? 'Return' : 'Sale'}
-                </span>
-              </li>
-            ))}
-          </ul>
-        )}
+        <div className="dashboard-bill-list-scroll">
+          {loading && bills.length === 0 ? (
+            <div className="dashboard-empty">Loading bills…</div>
+          ) : filteredBills.length === 0 ? (
+            <div className="dashboard-empty">No bills for this date{billNoFilter.trim() ? ' (with current filter)' : ''}.</div>
+          ) : (
+            <ul className="dashboard-bill-list">
+              {filteredBills.map((b) => (
+                <li key={`${b.billNo}-${b.billDate}`} className="dashboard-bill-row">
+                  <button
+                    type="button"
+                    className="dashboard-bill-no-btn"
+                    disabled={printingBillNo === b.billNo}
+                    onClick={() => handlePrintBill(b)}
+                    title="Print receipt"
+                  >
+                    {printingBillNo === b.billNo ? 'Printing…' : `Bill ${b.billNo}`}
+                  </button>
+                  <span className="dashboard-bill-meta">{b.counterCode || '—'}</span>
+                  <span className="dashboard-bill-meta">{b.customerName || '—'}</span>
+                  <span className="dashboard-bill-amount">
+                    QAR {Number(b.netBillAmount || 0).toFixed(2)}
+                  </span>
+                  <span className={`dashboard-bill-type ${isBillSalesReturn(b) ? 'return' : ''}`}>
+                    {isBillSalesReturn(b) ? 'Return' : 'Sale'}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
       </div>
     </div>
   )

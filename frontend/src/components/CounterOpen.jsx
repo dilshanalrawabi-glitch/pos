@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
-import { printCounterCloseReport } from '../services/thermalPrint'
+import { mergeCounterCloseSource, printCounterCloseReport } from '../services/thermalPrint'
 import '../styles/CounterSetup.css'
 
 function todayStr() {
@@ -12,30 +12,55 @@ function formatCloseConfirmDateTime() {
 }
 
 function parseMoney(v) {
-  const n = Number(v)
+  if (v == null || v === '') return 0
+  if (typeof v === 'number') return Number.isFinite(v) ? v : 0
+  const s = String(v).trim().replace(/,/g, '')
+  const n = parseFloat(s)
   return Number.isFinite(n) ? n : 0
+}
+
+/** First own key with a non-empty value wins (nested summary + snake_case). */
+function pickMoney(row, ...keys) {
+  if (!row || typeof row !== 'object') return 0
+  for (const k of keys) {
+    if (!Object.prototype.hasOwnProperty.call(row, k)) continue
+    const v = row[k]
+    if (v !== undefined && v !== null && v !== '') return parseMoney(v)
+  }
+  return 0
+}
+
+function pickMoneyOptional(row, ...keys) {
+  if (!row || typeof row !== 'object') return undefined
+  for (const k of keys) {
+    if (!Object.prototype.hasOwnProperty.call(row, k)) continue
+    const v = row[k]
+    if (v !== undefined && v !== null && v !== '') return parseMoney(v)
+  }
+  return undefined
 }
 
 /** Normalize API payload and derive checks: net = sales − returns; cash approx = net − card(sales) + card(returns) − credit − voucher */
 function buildSummaryView(data) {
   if (!data || data.ok === false) return null
-  const totalSales = parseMoney(data.totalSales)
-  const totalReturns = parseMoney(data.totalReturns)
-  const netTotal = parseMoney(data.netTotal)
+  const row = mergeCounterCloseSource(data)
+  const totalSales = pickMoney(row, 'totalSales', 'total_sales', 'TOTALSALES', 'TotalSales')
+  const totalReturns = pickMoney(row, 'totalReturns', 'total_returns', 'TOTALRETURNS', 'TotalReturns')
+  const netTotal = pickMoney(row, 'netTotal', 'net_total', 'NETTOTAL', 'NetTotal')
   const netCalc = Math.round((totalSales - totalReturns) * 100) / 100
-  const totalCardAmount = parseMoney(data.totalCardAmount)
-  const totalCardReturns = parseMoney(data.totalCardReturns)
-  const discountTotal = parseMoney(data.discountTotal)
-  const creditTotal = parseMoney(data.creditTotal)
-  const voucherTotal = parseMoney(data.voucherTotal)
-  const cashInBox = parseMoney(data.cashInBox)
+  const totalCardAmount = pickMoney(row, 'totalCardAmount', 'total_card_amount', 'TOTALCARDAMOUNT', 'TotalCardAmount')
+  const totalCardReturns = pickMoney(row, 'totalCardReturns', 'total_card_returns', 'TOTALCARDRETURNS', 'TotalCardReturns')
+  const discountTotal = pickMoney(row, 'discountTotal', 'discount_total', 'DISCOUNTTOTAL', 'DiscountTotal')
+  const creditTotal = pickMoney(row, 'creditTotal', 'credit_total', 'CREDITTOTAL', 'CreditTotal')
+  const voucherTotal = pickMoney(row, 'voucherTotal', 'voucher_total', 'VOUCHERTOTAL', 'VoucherTotal')
+  const cashInBox = pickMoney(row, 'cashInBox', 'cash_in_box', 'CASHINBOX', 'CashInBox')
   const cashApprox = Math.round((netTotal - totalCardAmount + totalCardReturns - creditTotal - voucherTotal) * 1000) / 1000
   return {
-    date: data.date,
-    counterCode: data.counterCode,
-    locationCode: data.locationCode,
-    saleCount: Number(data.saleCount) || 0,
-    returnCount: Number(data.returnCount) || 0,
+    date: row.date ?? data.date,
+    counterCode: row.counterCode ?? row.counter_code ?? data.counterCode,
+    locationCode: row.locationCode ?? row.location_code ?? data.locationCode,
+    saleCount: Number(row.saleCount ?? row.sale_count ?? data.saleCount) || 0,
+    returnCount: Number(row.returnCount ?? row.return_count ?? data.returnCount) || 0,
     totalSales,
     totalReturns,
     netTotal,
@@ -50,8 +75,8 @@ function buildSummaryView(data) {
     cashApprox,
     /** Server uses per-bill NET−CARD sums; this is the aggregate shortcut (should be close). */
     cashMatchesApprox: Math.abs(cashInBox - cashApprox) < 0.05,
-    note: data.note,
-    calculationNote: data.calculationNote,
+    note: row.note ?? data.note,
+    calculationNote: row.calculationNote ?? row.calculation_note ?? data.calculationNote,
   }
 }
 
@@ -63,6 +88,7 @@ function CounterOpen({
   user = null,
   counterCode: counterCodeFromParent = '',
   counterName: counterNameFromParent = '',
+  onCounterOperationsChanged,
 }) {
   const [date, setDate] = useState(todayStr())
   const [shiftCode, setShiftCode] = useState('')
@@ -197,33 +223,42 @@ function CounterOpen({
 
   const makeClosePrintData = useCallback(
     (summary, slipKind) => {
-      const companyName = typeof localStorage !== 'undefined' ? (localStorage.getItem('pos_company_name') || '').trim() : ''
-      const companyNameAr = typeof localStorage !== 'undefined' ? (localStorage.getItem('pos_company_name_ar') || '').trim() : ''
+      let s = {}
+      if (summary && typeof summary === 'object') {
+        try {
+          s = JSON.parse(JSON.stringify(summary))
+        } catch {
+          s = { ...summary }
+        }
+      }
       const branchName = typeof localStorage !== 'undefined' ? (localStorage.getItem('pos_branch_name') || '').trim() : ''
+      const locationTelephone =
+        typeof localStorage !== 'undefined' ? (localStorage.getItem('pos_location_telephone') || '').trim() : ''
       const closedBy = (user?.username || user?.userid || '').toString().trim()
       const uid = (user?.userid ?? '').toString().trim()
       const un = (user?.username ?? '').toString().trim()
       const cashierDisplay = [uid, un].filter(Boolean).join(' ').trim()
+      const row = mergeCounterCloseSource(s)
+      const cardByType = row.cardByType ?? row.card_by_type
       return {
         date,
         counterCode,
         locationCode: locationCode || '',
         locationName: locationName || '',
-        companyName: companyName || undefined,
-        companyNameAr: companyNameAr || undefined,
         branchName: branchName || undefined,
-        totalSales: summary.totalSales ?? 0,
-        totalReturns: summary.totalReturns ?? 0,
-        netTotal: summary.netTotal ?? 0,
+        locationTelephone: locationTelephone || undefined,
+        totalSales: pickMoney(row, 'totalSales', 'total_sales', 'TOTALSALES', 'TotalSales'),
+        totalReturns: pickMoney(row, 'totalReturns', 'total_returns', 'TOTALRETURNS', 'TotalReturns'),
+        netTotal: pickMoney(row, 'netTotal', 'net_total', 'NETTOTAL', 'NetTotal'),
         closedBy,
         cashierDisplay: cashierDisplay || closedBy,
-        totalCardAmount: summary.totalCardAmount ?? 0,
-        totalCardReturns: summary.totalCardReturns ?? 0,
-        cardByType: summary.cardByType ?? {},
-        discountTotal: summary.discountTotal ?? 0,
-        creditTotal: summary.creditTotal ?? 0,
-        voucherTotal: summary.voucherTotal ?? 0,
-        cashInBox: summary.cashInBox != null ? summary.cashInBox : undefined,
+        totalCardAmount: pickMoney(row, 'totalCardAmount', 'total_card_amount', 'TOTALCARDAMOUNT', 'TotalCardAmount'),
+        totalCardReturns: pickMoney(row, 'totalCardReturns', 'total_card_returns', 'TOTALCARDRETURNS', 'TotalCardReturns'),
+        cardByType: cardByType && typeof cardByType === 'object' ? cardByType : {},
+        discountTotal: pickMoney(row, 'discountTotal', 'discount_total', 'DISCOUNTTOTAL', 'DiscountTotal'),
+        creditTotal: pickMoney(row, 'creditTotal', 'credit_total', 'CREDITTOTAL', 'CreditTotal'),
+        voucherTotal: pickMoney(row, 'voucherTotal', 'voucher_total', 'VOUCHERTOTAL', 'VoucherTotal'),
+        cashInBox: pickMoneyOptional(row, 'cashInBox', 'cash_in_box', 'CASHINBOX', 'CashInBox'),
         crReconciled: 0,
         slipKind,
       }
@@ -276,8 +311,10 @@ function CounterOpen({
     })
       .then((res) => res.json())
       .then((data) => {
-        if (data.ok) fetchStatus()
-        else setActionError(data.error || 'Open failed')
+        if (data.ok) {
+          fetchStatus()
+          if (typeof onCounterOperationsChanged === 'function') onCounterOperationsChanged()
+        } else setActionError(data.error || 'Open failed')
       })
       .catch((err) => setActionError(err.message || 'Open failed'))
   }
@@ -301,6 +338,7 @@ function CounterOpen({
           return
         }
         await fetchStatus()
+        if (typeof onCounterOperationsChanged === 'function') onCounterOperationsChanged()
         try {
           const summary = await loadDailySummary()
           setReportSummary(summary)
@@ -335,9 +373,8 @@ function CounterOpen({
         </div>
 
         <section className="counter-setup-section">
-          <h3>Date &amp; Shift code</h3>
           <div className="counter-setup-row">
-            <label className="counter-setup-label" htmlFor="counter-open-date">Date (DATEOFOPEN)</label>
+            <label className="counter-setup-label" htmlFor="counter-open-date">Date of open</label>
             <input
               id="counter-open-date"
               type="date"
@@ -463,11 +500,6 @@ function CounterOpen({
                 </dd>
               </dl>
               {summaryView.note && <p className="counter-setup-muted" style={{ marginTop: 8 }}>{summaryView.note}</p>}
-              {summaryView.calculationNote && (
-                <p className="counter-setup-muted" style={{ marginTop: 8, fontSize: 12, lineHeight: 1.4 }}>
-                  {summaryView.calculationNote}
-                </p>
-              )}
             </div>
           )}
         </section>

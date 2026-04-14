@@ -1,11 +1,13 @@
 import '../styles/Sidebar.css'
 
-function Sidebar({ activeMenu = 'dashboard', onMenuSelect, user, onLogout, isOpen, onClose, locationCode = '', locationName = '', counterCode = '', counterName = '' }) {
+function Sidebar({ activeMenu = 'dashboard', onMenuSelect, user, onLogout, isOpen, onClose, locationCode = '', locationName = '', counterCode = '', counterName = '', billDateDisplay = '' }) {
   const roleLabel = user?.role ? user.role.charAt(0).toUpperCase() + user.role.slice(1) : ''
   const displayName = user?.userid ?? user?.username ?? ''
   const role = (user?.role || '').toLowerCase()
   const roll = Number(user?.rollcode ?? user?.rolecode ?? NaN)
-  const billDate = new Date().toLocaleDateString('en-GB', { day: '2-digit', month: '2-digit', year: 'numeric' }).replace(/\//g, '-')
+  const billDate =
+    (billDateDisplay && String(billDateDisplay).trim()) ||
+    new Date().toLocaleDateString('en-GB', { day: '2-digit', month: '2-digit', year: 'numeric' }).replace(/\//g, '-')
   // ROLECODE 1=IT (full), 2=Supervisor (Billing+CounterOpen), 3=Cashier (Billing only)
   const isIT = role === 'it' || role === 'manager' || role === 'admin'
   const isSupervisor = role === 'supervisor'

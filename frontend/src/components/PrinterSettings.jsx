@@ -126,10 +126,21 @@ export default function PrinterSettings() {
         placeholder="e.g. Branch - Counter name"
       />
 
-      <h3 className="printer-settings-section">QZ Tray signing files</h3>
+      <h3 className="printer-settings-section">QZ Tray signing (no &quot;Untrusted website&quot; prompt)</h3>
       <p className="printer-settings-desc">
-        Download the certificate and private key from the POS server for QZ Tray &quot;Site manager&quot; signing.
-        Treat the private key as confidential.
+        The POS loads <code className="printer-settings-code">digital-certificate.txt</code> from the API and signs requests with <code className="printer-settings-code">private-key.pem</code> on the server.
+        If you see <strong>QZ Tray Demo Cert / Untrusted website</strong> when paying, the API is still using a <em>generic</em> demo certificate. QZ will keep asking until this PC trusts the <em>same</em> key pair the API serves.
+      </p>
+      <p className="printer-settings-desc">
+        <strong>Fix (localhost dev, on this Windows PC):</strong> Right-click QZ Tray → Advanced → Site manager → <strong>+</strong> → Create New → Yes to generate keys, Yes to auto-install, Yes to copy to Desktop.
+        Replace the files in your project <code className="printer-settings-code">backend/certs/</code> with the new <code className="printer-settings-code">digital-certificate.txt</code> and <code className="printer-settings-code">private-key.pem</code> from the Desktop folder, restart the Python API (port <strong>7227</strong> by default), hard-refresh the POS page, then pay again.
+        Keep the API running so the browser can load <code className="printer-settings-code">http://your-host:7227/api/qz-tray/certificate</code> (same host as the POS page, e.g. Vite on 7117).
+      </p>
+      <p className="printer-settings-desc">
+        <strong>Quick workaround:</strong> click <strong>Allow</strong> and enable <strong>Remember this decision</strong> on the QZ dialog (you may still need to do this once per site/origin).
+      </p>
+      <p className="printer-settings-desc">
+        Optional: download the files currently on the server (for backup or another machine). Treat the private key as confidential.
       </p>
       {certError && (
         <div className="printer-settings-error printer-settings-cert-error">{certError}</div>

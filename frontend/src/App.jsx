@@ -64,6 +64,54 @@ function countersLookupUrl(apiBase) {
   return qs ? `${apiBase}/api/counters?${qs}` : `${apiBase}/api/counters`
 }
 
+const SESSION_BILL_DATE_KEY = 'pos_session_bill_date'
+
+/** YYYY-MM-DD (DATEOFOPEN) shown as DD-MM-YYYY; falls back to today if missing/invalid. */
+function formatBillDateEnGbFromIso(isoYyyyMmDd) {
+  if (!isoYyyyMmDd || !/^\d{4}-\d{2}-\d{2}$/.test(String(isoYyyyMmDd).trim())) {
+    return new Date().toLocaleDateString('en-GB', { day: '2-digit', month: '2-digit', year: 'numeric' }).replace(/\//g, '-')
+  }
+  const [y, m, d] = String(isoYyyyMmDd).trim().split('-').map(Number)
+  return new Date(y, m - 1, d).toLocaleDateString('en-GB', { day: '2-digit', month: '2-digit', year: 'numeric' }).replace(/\//g, '-')
+}
+
+/** Local noon for a calendar day string (receipts / slips avoid TZ shifting the printed date). */
+function dateAtNoonFromIso(isoYyyyMmDd) {
+  if (!isoYyyyMmDd || !/^\d{4}-\d{2}-\d{2}$/.test(String(isoYyyyMmDd).trim())) return new Date()
+  const [y, m, d] = String(isoYyyyMmDd).trim().split('-').map(Number)
+  return new Date(y, m - 1, d, 12, 0, 0)
+}
+
+/**
+ * DATEOFOPEN of the latest OPEN counter session for this counter (when status says open).
+ * Returns undefined if the request failed (caller should keep prior session date).
+ */
+async function fetchSessionBillDateFromOpenCounter(apiBase, counterCode) {
+  const cc = String(counterCode || '').trim()
+  if (!apiBase || !cc) return null
+  try {
+    const openedParams = new URLSearchParams()
+    openedParams.set('counterCode', cc)
+    const openedRes = await fetch(`${apiBase}/api/counter-operations/opened-dates?${openedParams}`)
+    const openedData = await openedRes.json().catch(() => ({}))
+    if (!openedRes.ok || openedData.ok !== true) return undefined
+    const last = openedData.lastOpenedDate || null
+    if (!last) return null
+    const { systemIp } = getLauncherSystemContext()
+    const statusParams = new URLSearchParams({ date: last })
+    if (systemIp) statusParams.set('systemIp', systemIp)
+    statusParams.set('counterCode', cc)
+    const statusRes = await fetch(`${apiBase}/api/counter-operations/status?${statusParams}`)
+    const statusData = await statusRes.json().catch(() => ({}))
+    if (!statusRes.ok || statusData.ok !== true) return undefined
+    if (!statusData.open) return null
+    return last
+  } catch (e) {
+    console.error('[SessionBillDate] fetch failed:', e)
+    return undefined
+  }
+}
+
 function App() {
   const [user, setUser] = useState(() => {
     try {
@@ -92,6 +140,15 @@ function App() {
   const [locationTelephone, setLocationTelephone] = useState(() => localStorage.getItem('pos_location_telephone') || '')
   const [counterCode, setCounterCode] = useState(() => localStorage.getItem('pos_counter_code') || 'CNT01')
   const [counterName, setCounterName] = useState(() => localStorage.getItem('pos_counter_name') || 'Counter 1')
+  /** Business bill date = counter DATEOFOPEN while session is OPEN (YYYY-MM-DD). */
+  const [sessionBillDate, setSessionBillDate] = useState(() => {
+    try {
+      const s = (localStorage.getItem(SESSION_BILL_DATE_KEY) || '').trim()
+      return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : ''
+    } catch (_) {
+      return ''
+    }
+  })
   const [billNo, setBillNo] = useState(() => {
     const stored = localStorage.getItem('pos_bill_no') || '1'
     const n = parseInt(stored, 10)
@@ -109,7 +166,26 @@ function App() {
   const [cartTotalPoints, setCartTotalPoints] = useState(0)
   const [cartLinePoints, setCartLinePoints] = useState({})
 
+  const refreshOpenSessionBillDate = useCallback(async () => {
+    const iso = await fetchSessionBillDateFromOpenCounter(getApiBase(), counterCode)
+    if (iso === undefined) return
+    if (iso) {
+      setSessionBillDate(iso)
+      try {
+        localStorage.setItem(SESSION_BILL_DATE_KEY, iso)
+      } catch (_) {}
+    } else {
+      setSessionBillDate('')
+      try {
+        localStorage.removeItem(SESSION_BILL_DATE_KEY)
+      } catch (_) {}
+    }
+  }, [counterCode])
 
+  useEffect(() => {
+    if (!user) return
+    refreshOpenSessionBillDate()
+  }, [user, counterCode, refreshOpenSessionBillDate])
 
   // Restore user from token on load (refresh: keep logged in; only relogin on 401)
   useEffect(() => {
@@ -244,6 +320,10 @@ function App() {
           setAuthLoading(false)
           return
         }
+        setSessionBillDate(lastOpenedDate)
+        try {
+          localStorage.setItem(SESSION_BILL_DATE_KEY, lastOpenedDate)
+        } catch (_) {}
       }
 
       // Supervisor: this workstation must already exist in COUNTER (IT counter setup); do not require counter "open"
@@ -292,6 +372,10 @@ function App() {
           const supStatusData = await supStatusRes.json()
           if (supStatusData.ok && supStatusData.open) {
             supervisorInitialView = 'dashboard'
+            setSessionBillDate(supLastOpened)
+            try {
+              localStorage.setItem(SESSION_BILL_DATE_KEY, supLastOpened)
+            } catch (_) {}
           }
         }
       }
@@ -355,6 +439,10 @@ function App() {
     } catch (_) {}
     setShowPaymentPage(false)
     setActiveView('dashboard')
+    setSessionBillDate('')
+    try {
+      localStorage.removeItem(SESSION_BILL_DATE_KEY)
+    } catch (_) {}
   }
 
   const fetchAndSetNextBillNo = async () => {
@@ -408,7 +496,7 @@ function App() {
       try {
         await printHoldSlip({
           billNo,
-          date: new Date(),
+          date: dateAtNoonFromIso(sessionBillDate),
           locationCode: locationCode || '',
           locationName: locationName || '',
           locationTelephone: locationTelephone || '',
@@ -860,7 +948,9 @@ function App() {
             customerCode: custCode,
             billNo,
             billAmount: receiptData.total ?? 0,
-            billDate: new Date().toISOString().slice(0, 10),
+            billDate: (sessionBillDate && /^\d{4}-\d{2}-\d{2}$/.test(sessionBillDate)
+              ? sessionBillDate
+              : new Date().toISOString().slice(0, 10)),
             isSalesReturn,
           }),
         })
@@ -881,7 +971,7 @@ function App() {
       const customerName = selectedCustomer?.CUST_FULL_NAME ?? selectedCustomer?.cust_full_name ?? selectedCustomer?.CUSTOMERNAME ?? selectedCustomer?.customername ?? ''
       await printReceipt({
         billNo,
-        date: new Date(),
+        date: dateAtNoonFromIso(sessionBillDate),
         locationCode: locationCode || '',
         locationName: locationName || '',
         locationTelephone: locationTelephone || '',
@@ -992,6 +1082,7 @@ function App() {
         locationName={locationName}
         counterCode={counterCode}
         counterName={counterName}
+        billDateDisplay={formatBillDateEnGbFromIso(sessionBillDate)}
       />
       <div className="main-area">
         <header className="top-bar">
@@ -1007,7 +1098,7 @@ function App() {
           <div className="header-pos-info">
             <span>Location code: {locationCode}</span>
             <span>Location name: {locationName}</span>
-            <span>Bill date: {new Date().toLocaleDateString('en-GB', { day: '2-digit', month: '2-digit', year: 'numeric' }).replace(/\//g, '-')}</span>
+            <span>Bill date: {formatBillDateEnGbFromIso(sessionBillDate)}</span>
             <span>Counter: {counterCode} {counterName}</span>
           </div>
           <div className="header-info">
@@ -1036,6 +1127,7 @@ function App() {
                   counterCode={counterCode}
                   counterName={counterName}
                   user={user}
+                  counterSessionBillDate={sessionBillDate}
                 />
               )}
               {showBilling && (
@@ -1093,6 +1185,7 @@ function App() {
                   user={user}
                   counterCode={counterCode}
                   counterName={counterName}
+                  onCounterOperationsChanged={refreshOpenSessionBillDate}
                 />
               )}
               {activeView === 'settings' && canView('settings') && (
