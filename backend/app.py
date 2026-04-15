@@ -1870,7 +1870,7 @@ ITEMLOG_TABLE_NAME = 'ITEMLOG'
 # HOLD table (TEMPBILLHDR): BILLNO, LOCATIONCODE, FLAG. At HOLD time FLAG=0 (held); draft FLAG=1.
 # HOLD detail (TEMPBILLDTL): BILLNO, SLNO, ITEMCODE, QUANTITY, RATE, MANUFACTURERID, ITEMFLAG.
 # ITEMJOURNAL: journal of item lines at payment; never deleted. RECEIPTNO=BILLNO, LINENO=SLNO, SOURCE_NO=billNo, TRANSTYPE=SALES, SOURCE_DOC=BILL.
-# ITEMLOG: snapshot per bill at payment (delete rows for DOCUMENTNO+LOCATIONCODE, then insert); SALE qty negative, SALE RETURN positive; FACTOR = integer (conversion × line QTY, rounded); QUANTITY keeps decimals.
+# ITEMLOG: snapshot per bill at payment (delete rows for DOCUMENTNO+LOCATIONCODE, then insert); SALE qty negative, SALE RETURN positive; FACTOR = integer (conversion × line QTY, rounded); QUANTITY keeps decimals; CREATEDDATE on insert (SYSDATE).
 FLAG_HELD = 0   # TEMPBILLHDR/TEMPBILLDTL: when bill is held
 FLAG_DRAFT = 1  # TEMPBILLHDR: when bill is draft/current cart
 _held_bills_fallback = {}  # key: (location_code, bill_no) -> { "counterCode", "heldDate", "customerCode", "items": [...] }
@@ -2031,7 +2031,8 @@ def _ensure_itemlog(cur):
             DOCUMENTNO NUMBER,
             LOCATIONCODE VARCHAR2(50),
             RATE NUMBER DEFAULT 0,
-            FACTOR NUMBER DEFAULT 0
+            FACTOR NUMBER DEFAULT 0,
+            CREATEDDATE DATE DEFAULT SYSDATE
         )
     """
     try:
@@ -2047,6 +2048,21 @@ def _ensure_itemlog(cur):
             raise
     try:
         cur.execute(f"ALTER TABLE {ITEMLOG_TABLE_NAME} ADD (FACTOR NUMBER)")
+    except oracledb.Error as e:
+        err_str = str(e).upper()
+        if (
+            'ORA-01430' in err_str
+            or '01430' in err_str
+            or 'ORA-00955' in err_str
+            or '00955' in err_str
+            or 'ORA-01031' in err_str
+            or '01031' in err_str
+        ):
+            pass
+        else:
+            pass
+    try:
+        cur.execute(f"ALTER TABLE {ITEMLOG_TABLE_NAME} ADD (CREATEDDATE DATE)")
     except oracledb.Error as e:
         err_str = str(e).upper()
         if (
@@ -3021,6 +3037,28 @@ def _billno_flag_char(value):
     return 'Y' if s == 'Y' else 'N'
 
 
+def _bill_date_business_iso_from_request(data):
+    """
+    Session / business bill date from client (counter DATEOFOPEN), YYYY-MM-DD or None.
+    Aligns BILLHDR.BILLDATE and BILLNOTABLE.BILLDATE with the counter-open day instead of wall-clock SYSDATE.
+    """
+    if not data:
+        return None
+    _bd = data.get('billDate') or data.get('bill_date') or data.get('BILLDATE')
+    if _bd is None or _bd == '':
+        return None
+    s = str(_bd).strip()
+    if len(s) < 10:
+        return None
+    head = s[:10]
+    if head[4:5] != '-' or head[7:8] != '-':
+        return None
+    y, m, d = head.split('-')
+    if not (y.isdigit() and m.isdigit() and d.isdigit()):
+        return None
+    return head
+
+
 @app.route('/api/billno/next', methods=['GET', 'POST'])
 def create_next_billno():
     """
@@ -3029,6 +3067,13 @@ def create_next_billno():
     2) Else: new_billno = MAX(BILLNO)+1, insert into BILLNOTABLE, return new_billno.
     """
     data = request.get_json(silent=True) or {}
+    _bill_date_lookup = dict(data)
+    _arg_bd = request.args.get('billDate') or request.args.get('bill_date')
+    if _arg_bd and not (_bill_date_lookup.get('billDate') or _bill_date_lookup.get('bill_date')):
+        _bill_date_lookup['billDate'] = _arg_bd
+    bill_date_business = _bill_date_business_iso_from_request(_bill_date_lookup)
+    _billdate_sql = "TO_DATE(:billdate_business, 'YYYY-MM-DD')" if bill_date_business else "SYSDATE"
+    _billno_ins_bind_extra = {"billdate_business": bill_date_business} if bill_date_business else {}
     _cnt = data.get('counterCode') or data.get('counter_code') or request.args.get('counterCode') or request.args.get('counter_code')
     counter_code = str(_cnt).strip() if _cnt is not None else ''
     counter_code = counter_code or None
@@ -3075,20 +3120,20 @@ def create_next_billno():
         new_billno = int(last_billno + 1)
         try:
             cur.execute(
-                f"INSERT INTO {BILLNO_TABLE_NAME} (BILLNO, FLAG, BILLDATE, BILLTIME, COUNTERCODE) VALUES (:billno, 'N', SYSDATE, TO_CHAR(SYSDATE, 'HH12:MI:SS AM'), :countercode)",
-                {"billno": new_billno, "countercode": counter_code_val}
+                f"INSERT INTO {BILLNO_TABLE_NAME} (BILLNO, FLAG, BILLDATE, BILLTIME, COUNTERCODE) VALUES (:billno, 'N', {_billdate_sql}, TO_CHAR(SYSDATE, 'HH12:MI:SS AM'), :countercode)",
+                {**{"billno": new_billno, "countercode": counter_code_val}, **_billno_ins_bind_extra},
             )
         except oracledb.Error as col_err:
             err_str = str(col_err).upper()
             if 'ORA-00913' in err_str or 'ORA-00904' in err_str or '00913' in err_str or '00904' in err_str:
                 cur.execute(
-                    f"INSERT INTO {BILLNO_TABLE_NAME} (BILLNO, FLAG, BILLDATE, BILLTIME) VALUES (:billno, 'N', SYSDATE, TO_CHAR(SYSDATE, 'HH12:MI:SS AM'))",
-                    {"billno": new_billno}
+                    f"INSERT INTO {BILLNO_TABLE_NAME} (BILLNO, FLAG, BILLDATE, BILLTIME) VALUES (:billno, 'N', {_billdate_sql}, TO_CHAR(SYSDATE, 'HH12:MI:SS AM'))",
+                    {**{"billno": new_billno}, **_billno_ins_bind_extra},
                 )
             elif 'ORA-01722' in err_str or '01722' in err_str:
                 cur.execute(
-                    f"INSERT INTO {BILLNO_TABLE_NAME} (BILLNO, FLAG, BILLDATE, BILLTIME) VALUES (:billno, 'N', SYSDATE, TO_CHAR(SYSDATE, 'HH12:MI:SS AM'))",
-                    {"billno": new_billno}
+                    f"INSERT INTO {BILLNO_TABLE_NAME} (BILLNO, FLAG, BILLDATE, BILLTIME) VALUES (:billno, 'N', {_billdate_sql}, TO_CHAR(SYSDATE, 'HH12:MI:SS AM'))",
+                    {**{"billno": new_billno}, **_billno_ins_bind_extra},
                 )
             else:
                 raise
@@ -3487,6 +3532,13 @@ def billdtl_insert():
     if not isinstance(items, list):
         return jsonify({"ok": False, "error": "items must be an array"}), 400
     item_count = len(items)
+    bill_date_business = _bill_date_business_iso_from_request(data)
+    billdate_hdr_sql = "TO_DATE(:billdate_business, 'YYYY-MM-DD')" if bill_date_business else "SYSDATE"
+    _hdr_date_bind = {"billdate_business": bill_date_business} if bill_date_business else {}
+
+    def _hdr_bind(bd):
+        return {**bd, **_hdr_date_bind} if _hdr_date_bind else bd
+
     conn = _get_connection()
     if not conn:
         return jsonify({"ok": False, "error": "Database unavailable"}), 503
@@ -3560,14 +3612,14 @@ def billdtl_insert():
                         SALESMANCODE, TRANSACTIONNO, ORDERNO, ENTRYNO, ADDRESS, PREVCARDNO, LPONO,
                         REDEMPTIONAMOUNT, REDEMPTIONPOINT, TOTALPOINT, HELPERCODE1, HELPERCODE2, GVTYPE, CHANNELCODE, ITEMCOUNT
                     ) VALUES (
-                        :loc, :billno, SYSDATE, :billtype, :countercode, 1, 0, :prevpoints,
+                        :loc, :billno, {billdate_hdr_sql}, :billtype, :countercode, 1, 0, :prevpoints,
                         :netbillamount, :cardamount, :cardno, :cardtype, :customercode, :customername,
                         0, :employeecode, TO_CHAR(SYSDATE, 'HH24:MI:SS'), 'N', :createdby, SYSDATE, 'P',
                         1, 0, 0, 1, 'DIRECT SALE', :prev_card_no, 0,
                         0, 0, :totalpoint, 0, 0, 'NORMAL', 1, :itemcount
                     )
                     """,
-                    _hdr_bind_ext,
+                    _hdr_bind(_hdr_bind_ext),
                 )
             except oracledb.Error as hdr_err:
                 err_str = str(hdr_err).upper()
@@ -3576,36 +3628,36 @@ def billdtl_insert():
                         cur.execute(
                             f"""
                             INSERT INTO {_hdr_tbl} (LOCATIONCODE, BILLNO, BILLDATE, BILLTYPE, COUNTERCODE, RESETNO, SESSIONCODE, PREVPOINTS, NETBILLAMOUNT, CARDAMOUNT, CARDNO, CARDTYPE, CUSTOMERCODE, CUSTOMERNAME)
-                            VALUES (:loc, :billno, SYSDATE, :billtype, :countercode, 1, 0, :prevpoints, :netbillamount, :cardamount, :cardno, :cardtype, :customercode, :customername)
+                            VALUES (:loc, :billno, {billdate_hdr_sql}, :billtype, :countercode, 1, 0, :prevpoints, :netbillamount, :cardamount, :cardno, :cardtype, :customercode, :customername)
                             """,
-                            _hdr_bind_full,
+                            _hdr_bind(_hdr_bind_full),
                         )
                     except oracledb.Error:
                         try:
                             cur.execute(
                                 f"""
                                 INSERT INTO {_hdr_tbl} (LOCATIONCODE, BILLNO, BILLDATE, BILLTYPE, COUNTERCODE, RESETNO, SESSIONCODE, PREVPOINTS, NETBILLAMOUNT, CARDAMOUNT, CUSTOMERCODE, CUSTOMERNAME)
-                                VALUES (:loc, :billno, SYSDATE, :billtype, :countercode, 1, 0, :prevpoints, :netbillamount, :cardamount, :customercode, :customername)
+                                VALUES (:loc, :billno, {billdate_hdr_sql}, :billtype, :countercode, 1, 0, :prevpoints, :netbillamount, :cardamount, :customercode, :customername)
                                 """,
-                                _hdr_bind_full,
+                                _hdr_bind(_hdr_bind_full),
                             )
                         except oracledb.Error:
                             try:
                                 cur.execute(
                                     f"""
                                     INSERT INTO {_hdr_tbl} (LOCATIONCODE, BILLNO, BILLDATE, BILLTYPE, COUNTERCODE, RESETNO, SESSIONCODE, PREVPOINTS, NETBILLAMOUNT, CUSTOMERCODE, CUSTOMERNAME)
-                                    VALUES (:loc, :billno, SYSDATE, :billtype, :countercode, 1, 0, :prevpoints, :netbillamount, :customercode, :customername)
+                                    VALUES (:loc, :billno, {billdate_hdr_sql}, :billtype, :countercode, 1, 0, :prevpoints, :netbillamount, :customercode, :customername)
                                     """,
-                                    _hdr_bind_no_card,
+                                    _hdr_bind(_hdr_bind_no_card),
                                 )
                             except oracledb.Error:
                                 try:
                                     cur.execute(
                                         f"""
                                         INSERT INTO {_hdr_tbl} (LOCATIONCODE, BILLNO, BILLDATE, BILLTYPE, COUNTERCODE, RESETNO, SESSIONCODE, PREVPOINTS)
-                                        VALUES (:loc, :billno, SYSDATE, :billtype, :countercode, 1, 0, :prevpoints)
+                                        VALUES (:loc, :billno, {billdate_hdr_sql}, :billtype, :countercode, 1, 0, :prevpoints)
                                         """,
-                                        _hdr_bind_min,
+                                        _hdr_bind(_hdr_bind_min),
                                     )
                                 except oracledb.Error:
                                     raise
@@ -3615,10 +3667,10 @@ def billdtl_insert():
                     _execute_hdr_ext_safe(
                         cur,
                         f"""
-                        UPDATE {_hdr_tbl} SET LOCATIONCODE = :loc, BILLDATE = SYSDATE, BILLTYPE = :billtype, COUNTERCODE = :countercode, RESETNO = 1, SESSIONCODE = 0, PREVPOINTS = :prevpoints, NETBILLAMOUNT = :netbillamount, CARDAMOUNT = :cardamount, CARDNO = :cardno, CARDTYPE = :cardtype, CUSTOMERCODE = :customercode, CUSTOMERNAME = :customername, DISCOUNTAMOUNT = 0, EMPLOYEECODE = :employeecode, BILLTIME = TO_CHAR(SYSDATE, 'HH24:MI:SS'), DELFLAG = 'N', CREATEDBY = :createdby, CREATEDDATE = SYSDATE, BILLSTATUS = 'P', SALESMANCODE = 1, TRANSACTIONNO = 0, ORDERNO = 0, ENTRYNO = 1, ADDRESS = 'DIRECT SALE', PREVCARDNO = :prev_card_no, LPONO = 0, REDEMPTIONAMOUNT = 0, REDEMPTIONPOINT = 0, TOTALPOINT = :totalpoint, HELPERCODE1 = 0, HELPERCODE2 = 0, GVTYPE = 'NORMAL', CHANNELCODE = 1, ITEMCOUNT = :itemcount
+                        UPDATE {_hdr_tbl} SET LOCATIONCODE = :loc, BILLDATE = {billdate_hdr_sql}, BILLTYPE = :billtype, COUNTERCODE = :countercode, RESETNO = 1, SESSIONCODE = 0, PREVPOINTS = :prevpoints, NETBILLAMOUNT = :netbillamount, CARDAMOUNT = :cardamount, CARDNO = :cardno, CARDTYPE = :cardtype, CUSTOMERCODE = :customercode, CUSTOMERNAME = :customername, DISCOUNTAMOUNT = 0, EMPLOYEECODE = :employeecode, BILLTIME = TO_CHAR(SYSDATE, 'HH24:MI:SS'), DELFLAG = 'N', CREATEDBY = :createdby, CREATEDDATE = SYSDATE, BILLSTATUS = 'P', SALESMANCODE = 1, TRANSACTIONNO = 0, ORDERNO = 0, ENTRYNO = 1, ADDRESS = 'DIRECT SALE', PREVCARDNO = :prev_card_no, LPONO = 0, REDEMPTIONAMOUNT = 0, REDEMPTIONPOINT = 0, TOTALPOINT = :totalpoint, HELPERCODE1 = 0, HELPERCODE2 = 0, GVTYPE = 'NORMAL', CHANNELCODE = 1, ITEMCOUNT = :itemcount
                         WHERE BILLNO = :billno
                         """,
-                        _hdr_bind_ext,
+                        _hdr_bind(_hdr_bind_ext),
                     )
                 except oracledb.Error as upd_err:
                     err_str = str(upd_err).upper()
@@ -3626,36 +3678,36 @@ def billdtl_insert():
                         try:
                             cur.execute(
                                 f"""
-                                UPDATE {_hdr_tbl} SET LOCATIONCODE = :loc, BILLDATE = SYSDATE, BILLTYPE = :billtype, COUNTERCODE = :countercode, RESETNO = 1, SESSIONCODE = 0, PREVPOINTS = :prevpoints, NETBILLAMOUNT = :netbillamount, CARDAMOUNT = :cardamount, CARDNO = :cardno, CARDTYPE = :cardtype, CUSTOMERCODE = :customercode, CUSTOMERNAME = :customername
+                                UPDATE {_hdr_tbl} SET LOCATIONCODE = :loc, BILLDATE = {billdate_hdr_sql}, BILLTYPE = :billtype, COUNTERCODE = :countercode, RESETNO = 1, SESSIONCODE = 0, PREVPOINTS = :prevpoints, NETBILLAMOUNT = :netbillamount, CARDAMOUNT = :cardamount, CARDNO = :cardno, CARDTYPE = :cardtype, CUSTOMERCODE = :customercode, CUSTOMERNAME = :customername
                                 WHERE BILLNO = :billno
                                 """,
-                                _hdr_bind_full,
+                                _hdr_bind(_hdr_bind_full),
                             )
                         except oracledb.Error:
                             try:
                                 cur.execute(
                                     f"""
-                                    UPDATE {_hdr_tbl} SET LOCATIONCODE = :loc, BILLDATE = SYSDATE, BILLTYPE = :billtype, COUNTERCODE = :countercode, RESETNO = 1, SESSIONCODE = 0, PREVPOINTS = :prevpoints, NETBILLAMOUNT = :netbillamount, CARDAMOUNT = :cardamount, CUSTOMERCODE = :customercode, CUSTOMERNAME = :customername
+                                    UPDATE {_hdr_tbl} SET LOCATIONCODE = :loc, BILLDATE = {billdate_hdr_sql}, BILLTYPE = :billtype, COUNTERCODE = :countercode, RESETNO = 1, SESSIONCODE = 0, PREVPOINTS = :prevpoints, NETBILLAMOUNT = :netbillamount, CARDAMOUNT = :cardamount, CUSTOMERCODE = :customercode, CUSTOMERNAME = :customername
                                     WHERE BILLNO = :billno
                                     """,
-                                    _hdr_bind_no_card,
+                                    _hdr_bind(_hdr_bind_no_card),
                                 )
                             except oracledb.Error:
                                 try:
                                     cur.execute(
                                         f"""
-                                        UPDATE {_hdr_tbl} SET LOCATIONCODE = :loc, BILLDATE = SYSDATE, BILLTYPE = :billtype, COUNTERCODE = :countercode, RESETNO = 1, SESSIONCODE = 0, PREVPOINTS = :prevpoints, NETBILLAMOUNT = :netbillamount, CUSTOMERCODE = :customercode, CUSTOMERNAME = :customername
+                                        UPDATE {_hdr_tbl} SET LOCATIONCODE = :loc, BILLDATE = {billdate_hdr_sql}, BILLTYPE = :billtype, COUNTERCODE = :countercode, RESETNO = 1, SESSIONCODE = 0, PREVPOINTS = :prevpoints, NETBILLAMOUNT = :netbillamount, CUSTOMERCODE = :customercode, CUSTOMERNAME = :customername
                                         WHERE BILLNO = :billno
                                         """,
-                                        _hdr_bind_no_card,
+                                        _hdr_bind(_hdr_bind_no_card),
                                     )
                                 except oracledb.Error:
                                     cur.execute(
                                         f"""
-                                        UPDATE {_hdr_tbl} SET LOCATIONCODE = :loc, BILLDATE = SYSDATE, BILLTYPE = :billtype, COUNTERCODE = :countercode, RESETNO = 1, SESSIONCODE = 0, PREVPOINTS = :prevpoints
+                                        UPDATE {_hdr_tbl} SET LOCATIONCODE = :loc, BILLDATE = {billdate_hdr_sql}, BILLTYPE = :billtype, COUNTERCODE = :countercode, RESETNO = 1, SESSIONCODE = 0, PREVPOINTS = :prevpoints
                                         WHERE BILLNO = :billno
                                         """,
-                                        _hdr_bind_min,
+                                        _hdr_bind(_hdr_bind_min),
                                     )
                     else:
                         pass
@@ -5223,50 +5275,62 @@ def hold_bill():
                     dtl_params = _dtl_params_from_cart()
                     net_bill_amount = sum(p['quantity'] * p['rate'] for p in dtl_params)
                     discount_amount = _to_float(data.get('discountAmount') or data.get('discount_amount') or data.get('DISCOUNTAMOUNT'), 0.0)
-                    billdate_str = datetime.datetime.now().strftime('%Y-%m-%d')
+                    bill_date_business = _bill_date_business_iso_from_request(data)
+                    billdate_str = bill_date_business or datetime.datetime.now().strftime('%Y-%m-%d')
                     billtime_str = datetime.datetime.now().strftime('%H:%M:%S')
                     bill_type = str(data.get('billtype') or data.get('BILLTYPE') or 'C').strip() or 'C'
                     card_type = (str(data.get('cardtype') or data.get('CARDTYPE') or '').strip()) or None
                     card_no = (str(data.get('cardno') or data.get('CARDNO') or '').strip()) or None
                     hdr_prevpoints = _to_float(data.get('prevpoints') or data.get('PREVPOINTS') or data.get('totalPoints') or 0, 0)
+                    _canceled_hdr_bind = {
+                        'loc': location_code,
+                        'billno': bill_no,
+                        'billdate': billdate_str,
+                        'billtime': billtime_str,
+                        'countercode': counter_code or None,
+                        'discount': discount_amount,
+                        'netamount': net_bill_amount,
+                        'billtype': bill_type,
+                        'cardtype': card_type,
+                        'cardno': card_no,
+                        'customercode': customer_code,
+                        'resetno': 1,
+                        'prevpoints': hdr_prevpoints,
+                    }
                     try:
                         cur.execute("""
-                            INSERT INTO TBLCANCELEDHDR (LOCATIONCODE, BILLNO, BILLDATE, BILLTIME, COUNTERCODE, DISCOUNTAMOUNT, NETBILLAMOUNT, BILLSTATUS, BILLTYPE, CARDTYPE, CARDNO, CUSTOMERCODE, RESETNO, PREVPOINTS)
-                            VALUES (:loc, :billno, TO_DATE(:billdate, 'YYYY-MM-DD'), :billtime, :countercode, :discount, :netamount, 'C', :billtype, :cardtype, :cardno, :customercode, :resetno, :prevpoints)
-                        """, {
-                            'loc': location_code,
-                            'billno': bill_no,
-                            'billdate': billdate_str,
-                            'billtime': billtime_str,
-                            'countercode': counter_code or None,
-                            'discount': discount_amount,
-                            'netamount': net_bill_amount,
-                            'billtype': bill_type,
-                            'cardtype': card_type,
-                            'cardno': card_no,
-                            'customercode': customer_code,
-                            'resetno': 1,
-                            'prevpoints': hdr_prevpoints,
-                        })
+                            INSERT INTO TBLCANCELEDHDR (LOCATIONCODE, BILLNO, BILLDATE, BILLTIME, COUNTERCODE, DISCOUNTAMOUNT, NETBILLAMOUNT, BILLSTATUS, BILLTYPE, CARDTYPE, CARDNO, CUSTOMERCODE, RESETNO, PREVPOINTS, CREATEDDATE)
+                            VALUES (:loc, :billno, TO_DATE(:billdate, 'YYYY-MM-DD'), :billtime, :countercode, :discount, :netamount, 'C', :billtype, :cardtype, :cardno, :customercode, :resetno, :prevpoints, SYSDATE)
+                        """, _canceled_hdr_bind)
                     except oracledb.Error as e:
-                        if 'ORA-00904' not in str(e).upper() and '00904' not in str(e).upper():
+                        err_u = str(e).upper()
+                        if 'ORA-00904' not in err_u and '00904' not in err_u:
                             print(f"[Hold] TBLCANCELEDHDR insert failed: {e}")
                         else:
                             try:
                                 cur.execute("""
-                                    INSERT INTO TBLCANCELEDHDR (LOCATIONCODE, BILLNO, BILLDATE, BILLTIME, COUNTERCODE, DISCOUNTAMOUNT, NETBILLAMOUNT, BILLSTATUS)
-                                    VALUES (:loc, :billno, TO_DATE(:billdate, 'YYYY-MM-DD'), :billtime, :countercode, :discount, :netamount, 'C')
-                                """, {
-                                    'loc': location_code,
-                                    'billno': bill_no,
-                                    'billdate': billdate_str,
-                                    'billtime': billtime_str,
-                                    'countercode': counter_code or None,
-                                    'discount': discount_amount,
-                                    'netamount': net_bill_amount,
-                                })
-                            except oracledb.Error as e2:
-                                print(f"[Hold] TBLCANCELEDHDR insert failed: {e2}")
+                                    INSERT INTO TBLCANCELEDHDR (LOCATIONCODE, BILLNO, BILLDATE, BILLTIME, COUNTERCODE, DISCOUNTAMOUNT, NETBILLAMOUNT, BILLSTATUS, BILLTYPE, CARDTYPE, CARDNO, CUSTOMERCODE, RESETNO, PREVPOINTS)
+                                    VALUES (:loc, :billno, TO_DATE(:billdate, 'YYYY-MM-DD'), :billtime, :countercode, :discount, :netamount, 'C', :billtype, :cardtype, :cardno, :customercode, :resetno, :prevpoints)
+                                """, _canceled_hdr_bind)
+                            except oracledb.Error as e1:
+                                if 'ORA-00904' not in str(e1).upper() and '00904' not in str(e1).upper():
+                                    print(f"[Hold] TBLCANCELEDHDR insert failed: {e1}")
+                                else:
+                                    try:
+                                        cur.execute("""
+                                            INSERT INTO TBLCANCELEDHDR (LOCATIONCODE, BILLNO, BILLDATE, BILLTIME, COUNTERCODE, DISCOUNTAMOUNT, NETBILLAMOUNT, BILLSTATUS)
+                                            VALUES (:loc, :billno, TO_DATE(:billdate, 'YYYY-MM-DD'), :billtime, :countercode, :discount, :netamount, 'C')
+                                        """, {
+                                            'loc': location_code,
+                                            'billno': bill_no,
+                                            'billdate': billdate_str,
+                                            'billtime': billtime_str,
+                                            'countercode': counter_code or None,
+                                            'discount': discount_amount,
+                                            'netamount': net_bill_amount,
+                                        })
+                                    except oracledb.Error as e2:
+                                        print(f"[Hold] TBLCANCELEDHDR insert failed: {e2}")
                     canceled_bind = [
                         {
                             'loc': location_code,
@@ -5463,27 +5527,39 @@ def void_line():
         rate = _to_float(item.get('price') or item.get('PRICE') or item.get('rate'), 0.0)
         manufacturer_id = str(item.get('manufactureId') or item.get('MANUFACTURERID') or item.get('manufacturerId') or '').strip()
         net_line_amount = qty * rate
-        billdate_str = datetime.datetime.now().strftime('%Y-%m-%d')
+        bill_date_business = _bill_date_business_iso_from_request(data)
+        billdate_str = bill_date_business or datetime.datetime.now().strftime('%Y-%m-%d')
         billtime_str = datetime.datetime.now().strftime('%H:%M:%S')
         conn = _get_connection()
         if conn:
             cur = None
             try:
                 cur = conn.cursor()
+                _void_hdr_bind = {
+                    'loc': location_code,
+                    'billno': bill_no,
+                    'billdate': billdate_str,
+                    'billtime': billtime_str,
+                    'countercode': counter_code or None,
+                    'netamount': net_line_amount,
+                }
                 try:
                     cur.execute("""
-                        INSERT INTO TBLCANCELEDHDR (LOCATIONCODE, BILLNO, BILLDATE, BILLTIME, COUNTERCODE, DISCOUNTAMOUNT, NETBILLAMOUNT, BILLSTATUS)
-                        VALUES (:loc, :billno, TO_DATE(:billdate, 'YYYY-MM-DD'), :billtime, :countercode, 0, :netamount, 'V')
-                    """, {
-                        'loc': location_code,
-                        'billno': bill_no,
-                        'billdate': billdate_str,
-                        'billtime': billtime_str,
-                        'countercode': counter_code or None,
-                        'netamount': net_line_amount,
-                    })
+                        INSERT INTO TBLCANCELEDHDR (LOCATIONCODE, BILLNO, BILLDATE, BILLTIME, COUNTERCODE, DISCOUNTAMOUNT, NETBILLAMOUNT, BILLSTATUS, CREATEDDATE)
+                        VALUES (:loc, :billno, TO_DATE(:billdate, 'YYYY-MM-DD'), :billtime, :countercode, 0, :netamount, 'V', SYSDATE)
+                    """, _void_hdr_bind)
                 except oracledb.Error as e:
-                    print(f"[VoidLine] TBLCANCELEDHDR insert failed: {e}")
+                    err_u = str(e).upper()
+                    if 'ORA-00904' in err_u or '00904' in err_u:
+                        try:
+                            cur.execute("""
+                                INSERT INTO TBLCANCELEDHDR (LOCATIONCODE, BILLNO, BILLDATE, BILLTIME, COUNTERCODE, DISCOUNTAMOUNT, NETBILLAMOUNT, BILLSTATUS)
+                                VALUES (:loc, :billno, TO_DATE(:billdate, 'YYYY-MM-DD'), :billtime, :countercode, 0, :netamount, 'V')
+                            """, _void_hdr_bind)
+                        except oracledb.Error as e2:
+                            print(f"[VoidLine] TBLCANCELEDHDR insert failed: {e2}")
+                    else:
+                        print(f"[VoidLine] TBLCANCELEDHDR insert failed: {e}")
                 try:
                     cur.execute("""
                         INSERT INTO TBLCANCELEDDTL (LOCATIONCODE, BILLNO, SLNO, ITEMCODE, QUANTITY, RATE, MANUFACTURERID)
@@ -5604,8 +5680,8 @@ def _insert_itemjournal_and_itemlog(cur, bill_no, location_code, dtl_params, is_
         print(f"[ItemLog] delete for bill warning: {e}")
     transtype_log = 'SALE RETURN' if is_sales_return else 'SALE'
     itemlog_sql = f"""
-        INSERT INTO {ITEMLOG_TABLE_NAME} (LOGNO, ITEMCODE, CURRENTSTOCK, TRANSACTIONTYPE, QUANTITY, UOM, DOCUMENTNO, LOCATIONCODE, RATE, FACTOR)
-        SELECT (SELECT NVL(MAX(L.LOGNO), 0) + 1 FROM {ITEMLOG_TABLE_NAME} L), :itemcode, 0, :transtype, :quantity, :uom, :documentno, :locationcode, :rate, :factor
+        INSERT INTO {ITEMLOG_TABLE_NAME} (LOGNO, ITEMCODE, CURRENTSTOCK, TRANSACTIONTYPE, QUANTITY, UOM, DOCUMENTNO, LOCATIONCODE, RATE, FACTOR, CREATEDDATE)
+        SELECT (SELECT NVL(MAX(L.LOGNO), 0) + 1 FROM {ITEMLOG_TABLE_NAME} L), :itemcode, 0, :transtype, :quantity, :uom, :documentno, :locationcode, :rate, :factor, SYSDATE
         FROM DUAL
     """
     for p in dtl_params:
@@ -5645,8 +5721,8 @@ def _insert_itemjournal_and_itemlog(cur, bill_no, location_code, dtl_params, is_
             err_str = str(e).upper()
             if '00904' in err_str or 'ORA-00904' in err_str:
                 itemlog_sql_no_factor = f"""
-                    INSERT INTO {ITEMLOG_TABLE_NAME} (LOGNO, ITEMCODE, CURRENTSTOCK, TRANSACTIONTYPE, QUANTITY, UOM, DOCUMENTNO, LOCATIONCODE, RATE)
-                    SELECT (SELECT NVL(MAX(L.LOGNO), 0) + 1 FROM {ITEMLOG_TABLE_NAME} L), :itemcode, 0, :transtype, :quantity, :uom, :documentno, :locationcode, :rate
+                    INSERT INTO {ITEMLOG_TABLE_NAME} (LOGNO, ITEMCODE, CURRENTSTOCK, TRANSACTIONTYPE, QUANTITY, UOM, DOCUMENTNO, LOCATIONCODE, RATE, CREATEDDATE)
+                    SELECT (SELECT NVL(MAX(L.LOGNO), 0) + 1 FROM {ITEMLOG_TABLE_NAME} L), :itemcode, 0, :transtype, :quantity, :uom, :documentno, :locationcode, :rate, SYSDATE
                     FROM DUAL
                 """
                 try:

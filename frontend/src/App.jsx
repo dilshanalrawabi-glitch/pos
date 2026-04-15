@@ -450,7 +450,11 @@ function App() {
       const res = await fetch(`${getApiBase()}/api/billno/next`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ flag: 0, counterCode: counterCode || '' }),
+        body: JSON.stringify({
+          flag: 0,
+          counterCode: counterCode || '',
+          ...(sessionBillDate && /^\d{4}-\d{2}-\d{2}$/.test(sessionBillDate) ? { billDate: sessionBillDate } : {}),
+        }),
       })
       const data = await res.json().catch(() => ({}))
       if (res.ok && data.billNo != null) {
@@ -489,6 +493,7 @@ function App() {
           customerCode: selectedCustomer?.CUSTOMERCODE || selectedCustomer?.customercode || null,
           items: cart,
           suspend: isSuspend,
+          ...(sessionBillDate && /^\d{4}-\d{2}-\d{2}$/.test(sessionBillDate) ? { billDate: sessionBillDate } : {}),
         }),
       })
       const data = await res.json()
@@ -551,6 +556,7 @@ function App() {
           locationCode,
           counterCode,
           item: itemToVoid,
+          ...(sessionBillDate && /^\d{4}-\d{2}-\d{2}$/.test(sessionBillDate) ? { billDate: sessionBillDate } : {}),
         }),
       }).catch(err => console.error('Void line API failed:', err))
     }
@@ -888,6 +894,7 @@ function App() {
       locationCode: locationCode || '',
       billNo,
       counterCode: counterCode || '',
+      ...(sessionBillDate && /^\d{4}-\d{2}-\d{2}$/.test(sessionBillDate) ? { billDate: sessionBillDate } : {}),
       isSalesReturn,
       invoiceCode: invoiceCode != null ? invoiceCode : undefined,
       totalPoints: cartTotalPoints,
