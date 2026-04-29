@@ -38,8 +38,17 @@ const ARABIC_CODEPAGE = ESC + '\x74\x25'
 const LATIN_CODEPAGE_PC437 = ESC + '\x74\x00'
 const CUT = GS + '\x56\x00' // full cut
 
+/** ESC/POS cash drawer pulse (Epson-style). Pin 2 = m 0, pin 5 = m 1. t1/t2 = on/off times (×2 ms). */
+function escPosDrawerKick(pin = 0) {
+  const m = pin === 1 ? 1 : 0
+  return ESC + '\x70' + String.fromCharCode(m) + '\x19\xFA'
+}
+
 const PRINTER_KEY = 'pos_receipt_printer'
-const ENCODING_KEY = 'pos_receipt_encoding' // 'IBM864' (default Arabic) or 'Cp1256' (Windows Arabic) — set in Settings if Arabic garbled
+const ENCODING_KEY =
+  'pos_receipt_encoding' // 'IBM864' (Epson Arabic + QZ shaping) | 'Cp1256' | 'UTF-8' — Settings; IBM864 failures retry once as Cp1256
+const DRAWER_ENABLE_KEY = 'pos_cash_drawer_enabled' // '1' on (default), '0' off
+const DRAWER_PIN_KEY = 'pos_cash_drawer_pin' // '0' = pin 2, '1' = pin 5
 const RECEIPT_WIDTH = 48 // full width for 80mm paper; use 42 for 58mm
 
 /** Register once: public cert + server-side signing (matches backend SHA-512). */
@@ -101,6 +110,27 @@ async function ensureQzSecurity(qz) {
       .catch(reject)
   })
   _qzSecurityConfigured = true
+}
+
+/**
+ * QZ Tray’s IBM864 path uses Bidi + ICU ArabicShaping on any chunk containing non–Latin-1
+ * characters; tashkeel (combining diacritics) on product names often triggers
+ * "Cannot parse (PLAIN)… into a raw COMMAND command: Input length = 1".
+ * Removing Unicode combining marks (Mc, Me, Mn) keeps letters readable and avoids that failure.
+ */
+function stripThermalCombiningMarks(value) {
+  if (value == null || value === '') return ''
+  try {
+    return String(value).normalize('NFC').replace(/\p{M}+/gu, '')
+  } catch {
+    return String(value)
+  }
+}
+
+/** True if QZ print failed in a way that may be fixed by Cp1256 (skips IBM864 shaping). */
+function isQzThermalEncodingFailure(err) {
+  const msg = err?.message || String(err)
+  return /cannot parse\s*\(plain\)|arabicshaping/i.test(msg)
 }
 
 // Arabic labels (bilingual receipt) — UTF-8; QZ Tray converts to IBM864 when encoding set
@@ -195,6 +225,32 @@ function _isPlainObject(o) {
  * Outer envelope last must NOT win over nested totals — use `{ ...data, ...nest }` so
  * e.g. `{ totalSales: 0, data: { totalSales: 150 } }` resolves to 150.
  */
+function cashDrawerKickEscPos() {
+  if (typeof localStorage === 'undefined') return null
+  const en = localStorage.getItem(DRAWER_ENABLE_KEY)
+  if (en === '0' || en === 'false') return null
+  const pin = localStorage.getItem(DRAWER_PIN_KEY) === '1' ? 1 : 0
+  return escPosDrawerKick(pin)
+}
+
+/**
+ * Whether to send a drawer kick with this receipt (respects Settings + payment).
+ * Pass openCashDrawer: false from reprints. Omit or use payment inference for checkout.
+ */
+function shouldOpenCashDrawerForReceipt(receiptData) {
+  if (!receiptData || typeof receiptData !== 'object') return false
+  if (typeof localStorage !== 'undefined') {
+    const en = localStorage.getItem(DRAWER_ENABLE_KEY)
+    if (en === '0' || en === 'false') return false
+  }
+  if (receiptData.openCashDrawer === false) return false
+  if (receiptData.openCashDrawer === true) return true
+  const pm = String(receiptData.paymentMethod || 'cash').toLowerCase()
+  if (pm === 'credit' || pm === 'card') return false
+  if (pm === 'split') return parseReceiptAmount(receiptData.cashAmount) > 0
+  return true
+}
+
 export function mergeCounterCloseSource(data) {
   if (!data || typeof data !== 'object') return {}
   const nest =
@@ -237,7 +293,7 @@ function lineLabelValue(label, value) {
  * Same top block as sales receipt: bold location heading, margin, optional telephone, dashed line.
  */
 function pushLocationHeaderEscPos(lines, locationHeading, locationTelephone) {
-  const heading = String(locationHeading ?? '').trim().slice(0, RECEIPT_WIDTH)
+  const heading = stripThermalCombiningMarks(String(locationHeading ?? '').trim()).slice(0, RECEIPT_WIDTH)
   lines.push(FONT_SMALL)
   lines.push(CENTER)
   lines.push(FONT_NORMAL)
@@ -246,7 +302,7 @@ function pushLocationHeaderEscPos(lines, locationHeading, locationTelephone) {
   lines.push(BOLD_OFF)
   lines.push(LF)
   lines.push(FONT_SMALL)
-  const tel = String(locationTelephone ?? '').trim()
+  const tel = stripThermalCombiningMarks(String(locationTelephone ?? '').trim())
   if (tel) {
     lines.push(tel.slice(0, RECEIPT_WIDTH) + LF)
   }
@@ -276,7 +332,9 @@ async function buildEscPosHoldSlip(data, encoding = 'IBM864') {
   const dateStr = d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }).replace(/\s/g, ' ')
   const timeStr = d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true }).toLowerCase()
 
-  const locationHeading = (branchName || locationName || locationCode || '').trim().slice(0, RECEIPT_WIDTH)
+  const locationHeading = stripThermalCombiningMarks(
+    (branchName || locationName || locationCode || '').trim()
+  ).slice(0, RECEIPT_WIDTH)
 
   const lines = []
   lines.push(INIT)
@@ -293,9 +351,12 @@ async function buildEscPosHoldSlip(data, encoding = 'IBM864') {
   lines.push(LEFT)
   lines.push(FONT_SMALL)
   lines.push(lineLabelValue('Bill No', String(billNo ?? '')))
-  lines.push(lineLabelValue('User', (userName || '--').toString().slice(0, 22)))
-  lines.push(lineLabelValue('Location Code', (locationCode || '--').toString()))
-  const counterLine = [counterCode, counterName].filter(Boolean).join(' ').trim() || '--'
+  lines.push(
+    lineLabelValue('User', stripThermalCombiningMarks((userName || '--').toString()).slice(0, 22))
+  )
+  lines.push(lineLabelValue('Location Code', stripThermalCombiningMarks((locationCode || '--').toString())))
+  const counterLine =
+    stripThermalCombiningMarks([counterCode, counterName].filter(Boolean).join(' ').trim()) || '--'
   lines.push(lineLabelValue('Counter', counterLine.slice(0, RECEIPT_WIDTH)))
   lines.push(lineLabelValue('Date', dateStr))
   lines.push(lineLabelValue('Time', timeStr))
@@ -343,6 +404,8 @@ function buildEscPosReceipt(data, encoding = 'IBM864') {
     amountTendered = 0,
     change = 0,
     isSalesReturn = false,
+    /** true = show “COPY PRINT” banner at top (e.g. Dashboard reprint) */
+    copyPrintHeading = false,
   } = data
 
   const d = date instanceof Date ? date : new Date(date)
@@ -350,13 +413,23 @@ function buildEscPosReceipt(data, encoding = 'IBM864') {
   const timeStr = d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true }).toLowerCase()
 
   const netTotal = total - (Number(discount) || 0)
-  const locationHeading = (branchName || locationName || locationCode || '').trim().slice(0, RECEIPT_WIDTH)
+  const locationHeading = stripThermalCombiningMarks(
+    (branchName || locationName || locationCode || '').trim()
+  ).slice(0, RECEIPT_WIDTH)
 
   const lines = []
 
   lines.push(INIT)
   if (encoding === 'IBM864') {
     lines.push(ARABIC_CODEPAGE)
+  }
+  if (copyPrintHeading) {
+    lines.push(CENTER)
+    lines.push(FONT_NORMAL)
+    lines.push(BOLD_ON)
+    lines.push('COPY PRINT'.slice(0, RECEIPT_WIDTH) + LF)
+    lines.push(BOLD_OFF)
+    lines.push(LF)
   }
   pushLocationHeaderEscPos(lines, locationHeading, locationTelephone)
   lines.push(CENTER)  // center all body content
@@ -380,10 +453,10 @@ function buildEscPosReceipt(data, encoding = 'IBM864') {
 
   items.forEach((item, idx) => {
     const slNo = idx + 1
-    const manufId = getManufactureId(item)
-    const name = getItemName(item)
-    const details = getItemDetails(item)
-    const nameAr = getItemNameAr(item)
+    const manufId = stripThermalCombiningMarks(getManufactureId(item))
+    const name = stripThermalCombiningMarks(getItemName(item))
+    const details = stripThermalCombiningMarks(getItemDetails(item))
+    const nameAr = stripThermalCombiningMarks(getItemNameAr(item))
     const qty = Number(item.quantity) || 0
     const rate = Number(item.price) || 0
     const amt = qty * rate
@@ -431,7 +504,11 @@ function buildEscPosReceipt(data, encoding = 'IBM864') {
   // ----- TRANSACTION DETAILS -----
   lines.push(dashedLine())
   lines.push(CENTER)  // content centered on receipt
-  lines.push((customerName ? `Customer : ${customerName}` : 'Customer : --') + LF)
+  lines.push(
+    (customerName
+      ? `Customer : ${stripThermalCombiningMarks(customerName)}`
+      : 'Customer : --') + LF
+  )
   const pmDisplay =
     pmNorm === 'cash'
       ? 'Cash'
@@ -442,7 +519,9 @@ function buildEscPosReceipt(data, encoding = 'IBM864') {
           : String(paymentMethod || 'card')
   lines.push(lineLabelValue('Payment Type', pmDisplay))
   lines.push(lineLabelValue('Total Points', (Number(totalPoints) || 0).toFixed(3)))
-  lines.push(lineLabelValue('Served By : ' + (userName || '--'), AR.cashierName))
+  lines.push(
+    lineLabelValue('Served By : ' + stripThermalCombiningMarks((userName || '--').toString()), AR.cashierName)
+  )
   lines.push(LF)
 
   // Receipt | Date | Time | POS – full width
@@ -523,7 +602,9 @@ export function buildEscPosCounterCloseReport(data, encoding = 'IBM864') {
   const creditTotal = amountFromRow(row, ['creditTotal', 'credit_total', 'CREDITTOTAL'])
   const voucherTotal = amountFromRow(row, ['voucherTotal', 'voucher_total', 'VOUCHERTOTAL'])
 
-  const locationHeading = (branchName || locationName || locationCode || '').trim().slice(0, RECEIPT_WIDTH)
+  const locationHeading = stripThermalCombiningMarks(
+    (branchName || locationName || locationCode || '').trim()
+  ).slice(0, RECEIPT_WIDTH)
 
   const lines = []
   lines.push(INIT)
@@ -555,8 +636,8 @@ export function buildEscPosCounterCloseReport(data, encoding = 'IBM864') {
   const closingDatePart = formatCounterCloseDate(date)
   const closingClock = closingAt.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true })
 
-  lines.push(lineLabelValue('Counter', String(counterCode || '—')))
-  const cashierLine = (cashierDisplay || closedBy || '').toString().trim()
+  lines.push(lineLabelValue('Counter', stripThermalCombiningMarks(String(counterCode || '—'))))
+  const cashierLine = stripThermalCombiningMarks((cashierDisplay || closedBy || '').toString().trim())
   if (cashierLine) lines.push(lineLabelValue('Cashier', cashierLine.slice(0, 22)))
   lines.push(
     ((isCheckCopy ? 'Check time : ' : 'Closing time : ') + closingDatePart + ' ' + closingClock).slice(0, RECEIPT_WIDTH) + LF
@@ -575,7 +656,7 @@ export function buildEscPosCounterCloseReport(data, encoding = 'IBM864') {
   const cardKeys = Object.keys(cardMap)
   if (cardKeys.length > 0) {
     cardKeys.sort().forEach((k) => {
-      lines.push(lineLabelValue(k, formatReceiptAmount2(cardMap[k])))
+      lines.push(lineLabelValue(stripThermalCombiningMarks(k), formatReceiptAmount2(cardMap[k])))
     })
   } else if (parseReceiptAmount(totalCardAmount) > 0) {
     lines.push(lineLabelValue('CARD', formatReceiptAmount2(totalCardAmount)))
@@ -648,15 +729,31 @@ export async function printCounterCloseReport(reportData) {
     }
 
     const printerName = await resolvePrinterName(qz)
-    const encoding = localStorage.getItem(ENCODING_KEY) || 'IBM864'
-    const payload = buildEscPosCounterCloseReport(reportData, encoding)
+    let encoding = localStorage.getItem(ENCODING_KEY) || 'IBM864'
 
-    const config = qz.configs.create(printerName, {
-      encoding,
-      ...(printerName.toLowerCase().includes('epson') || printerName.toLowerCase().includes('tm') ? {} : { forceRaw: true }),
-    })
+    const counterCloseConfig = (enc) =>
+      qz.configs.create(printerName, {
+        encoding: enc,
+        ...(printerName.toLowerCase().includes('epson') || printerName.toLowerCase().includes('tm')
+          ? {}
+          : { forceRaw: true }),
+      })
 
-    await qz.print(config, payload)
+    const printCounterCloseOnce = async (enc) => {
+      const payload = buildEscPosCounterCloseReport(reportData, enc)
+      await qz.print(counterCloseConfig(enc), payload)
+    }
+
+    try {
+      await printCounterCloseOnce(encoding)
+    } catch (printErr) {
+      if (encoding === 'IBM864' && isQzThermalEncodingFailure(printErr)) {
+        console.warn('[ThermalPrint] Retrying counter close with Cp1256 after IBM864 failure:', printErr)
+        await printCounterCloseOnce('Cp1256')
+      } else {
+        throw printErr
+      }
+    }
     console.info('[ThermalPrint] Counter close report printed')
   } catch (err) {
     console.error('[ThermalPrint] Counter close print failed:', err)
@@ -721,8 +818,8 @@ export async function printReceipt(receiptData) {
     }
 
     const printerName = await resolvePrinterName(qz)
-    const encoding = localStorage.getItem(ENCODING_KEY) || 'IBM864'
-    const lines = buildEscPosReceipt(receiptData, encoding)
+    let encoding = localStorage.getItem(ENCODING_KEY) || 'IBM864'
+
     let barcodeChunk
     try {
       barcodeChunk = await createBillNoBarcodeQzImage(receiptData.billNo)
@@ -730,20 +827,56 @@ export async function printReceipt(receiptData) {
       console.warn('[ThermalPrint] Receipt barcode skipped:', e)
       barcodeChunk = null
     }
-    const data = [
-      ...lines,
-      ...(barcodeChunk ? [CENTER, FONT_SMALL, barcodeChunk, LF] : ['*' + String(receiptData.billNo ?? '').padStart(12, '0') + '*' + LF, LF]),
-      LF + LF + LF + LF,
-      CUT,
-    ]
+    const drawerKick = shouldOpenCashDrawerForReceipt(receiptData) ? cashDrawerKickEscPos() : null
+    const barcodeBlock = barcodeChunk
+      ? [CENTER, FONT_SMALL, barcodeChunk, LF]
+      : ['*' + String(receiptData.billNo ?? '').padStart(12, '0') + '*' + LF, LF]
+    const feedBeforeCut = [LF + LF + LF + LF]
 
-    const config = qz.configs.create(printerName, {
-      encoding, // IBM864 = Arabic (Epson); try Cp1256 if Arabic still wrong
-      ...(printerName.toLowerCase().includes('epson') || printerName.toLowerCase().includes('tm') ? {} : { forceRaw: true }),
-    })
+    /** Match backend / API: treat only explicit true-ish as sales return (avoid truthy string "false"). */
+    const isSalesReturnReceipt = [true, 'true', '1', 1].includes(receiptData?.isSalesReturn)
 
-    await qz.print(config, data)
-    console.info('[ThermalPrint] Receipt printed successfully')
+    const buildReceiptPrintData = (enc) => {
+      const lines = buildEscPosReceipt(receiptData, enc)
+      const oneReceipt = (withDrawerKick) => [
+        ...lines,
+        ...barcodeBlock,
+        ...feedBeforeCut,
+        ...(withDrawerKick && drawerKick ? [drawerKick] : []),
+        CUT,
+      ]
+      return isSalesReturnReceipt
+        ? [...oneReceipt(!!drawerKick), ...oneReceipt(false)]
+        : oneReceipt(!!drawerKick)
+    }
+
+    const receiptConfig = (enc) =>
+      qz.configs.create(printerName, {
+        encoding: enc,
+        ...(printerName.toLowerCase().includes('epson') || printerName.toLowerCase().includes('tm')
+          ? {}
+          : { forceRaw: true }),
+      })
+
+    const printReceiptOnce = async (enc) => {
+      await qz.print(receiptConfig(enc), buildReceiptPrintData(enc))
+    }
+
+    try {
+      await printReceiptOnce(encoding)
+    } catch (printErr) {
+      if (encoding === 'IBM864' && isQzThermalEncodingFailure(printErr)) {
+        console.warn('[ThermalPrint] Retrying receipt print with Cp1256 after IBM864 failure:', printErr)
+        await printReceiptOnce('Cp1256')
+      } else {
+        throw printErr
+      }
+    }
+    console.info(
+      isSalesReturnReceipt
+        ? '[ThermalPrint] Sales return: 2 receipt copies printed'
+        : '[ThermalPrint] Receipt printed successfully'
+    )
   } catch (err) {
     console.error('[ThermalPrint] Failed to print:', err)
     const msg = err?.message || String(err)
@@ -779,15 +912,31 @@ export async function printHoldSlip(holdData) {
     }
 
     const printerName = await resolvePrinterName(qz)
-    const encoding = localStorage.getItem(ENCODING_KEY) || 'IBM864'
-    const payload = await buildEscPosHoldSlip(holdData, encoding)
+    let encoding = localStorage.getItem(ENCODING_KEY) || 'IBM864'
 
-    const config = qz.configs.create(printerName, {
-      encoding,
-      ...(printerName.toLowerCase().includes('epson') || printerName.toLowerCase().includes('tm') ? {} : { forceRaw: true }),
-    })
+    const holdSlipConfig = (enc) =>
+      qz.configs.create(printerName, {
+        encoding: enc,
+        ...(printerName.toLowerCase().includes('epson') || printerName.toLowerCase().includes('tm')
+          ? {}
+          : { forceRaw: true }),
+      })
 
-    await qz.print(config, payload)
+    const printHoldSlipOnce = async (enc) => {
+      const payload = await buildEscPosHoldSlip(holdData, enc)
+      await qz.print(holdSlipConfig(enc), payload)
+    }
+
+    try {
+      await printHoldSlipOnce(encoding)
+    } catch (printErr) {
+      if (encoding === 'IBM864' && isQzThermalEncodingFailure(printErr)) {
+        console.warn('[ThermalPrint] Retrying hold slip with Cp1256 after IBM864 failure:', printErr)
+        await printHoldSlipOnce('Cp1256')
+      } else {
+        throw printErr
+      }
+    }
     console.info('[ThermalPrint] Hold slip printed')
   } catch (err) {
     console.error('[ThermalPrint] Hold slip print failed:', err)

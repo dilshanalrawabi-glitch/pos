@@ -108,6 +108,8 @@ export default function Dashboard({
       const h = data.header || {}
       const billDateObj = h.billDate ? new Date(h.billDate) : new Date(`${billDate}T12:00:00`)
       await printReceipt({
+        openCashDrawer: false,
+        copyPrintHeading: true,
         billNo: h.billNo ?? bno,
         date: billDateObj,
         locationCode: h.locationCode || locationCode || '',
@@ -154,6 +156,7 @@ export default function Dashboard({
 
       <form
         className="dashboard-bill-form"
+        autoComplete="off"
         onSubmit={(e) => {
           e.preventDefault()
           loadBills({ useBillNoServerFilter: true })
@@ -166,6 +169,7 @@ export default function Dashboard({
               type="date"
               value={billDate}
               onChange={(e) => setBillDate(e.target.value)}
+              autoComplete="off"
             />
           </label>
           <label className="dashboard-field dashboard-field-grow">
@@ -176,6 +180,8 @@ export default function Dashboard({
               placeholder="Search bill no"
               value={billNoFilter}
               onChange={(e) => setBillNoFilter(e.target.value)}
+              autoComplete="off"
+              spellCheck={false}
             />
           </label>
           <div className="dashboard-form-actions">

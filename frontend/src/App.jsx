@@ -158,6 +158,8 @@ function App() {
   const [customers, setCustomers] = useState([])
   const [selectedCustomer, setSelectedCustomer] = useState(null)
   const [showPaymentPage, setShowPaymentPage] = useState(false)
+  const [creditCheckoutLoading, setCreditCheckoutLoading] = useState(false)
+  const creditCheckoutInFlightRef = useRef(false)
   const [selectedCartItemId, setSelectedCartItemId] = useState(null)
   const [showSupervisorModal, setShowSupervisorModal] = useState(false)
   const [supervisorModalActionLabel, setSupervisorModalActionLabel] = useState('')
@@ -574,23 +576,6 @@ function App() {
     handleHold(true)
   }
 
-  const toggleSalesReturn = useCallback(() => {
-    setIsSalesReturn(prev => {
-      const next = !prev
-      if (!next) {
-        setCart(c => {
-          const updated = c.map(item => ({
-            ...item,
-            quantity: item.void ? item.quantity : Math.max(1, Math.abs(Number(item.quantity) || 0)),
-          }))
-          syncCartToDb(updated)
-          return updated
-        })
-      }
-      return next
-    })
-  }, [])
-
   const requestSupervisorAction = (actionLabel, callback) => {
     if (typeof callback !== 'function') return
     pendingSupervisorCallbackRef.current = callback
@@ -600,9 +585,9 @@ function App() {
 
   const handleSalesReturnClick = () => {
     if (isSalesReturn) {
-      requestSupervisorAction('Sale', toggleSalesReturn)
+      requestSupervisorAction('Sale', () => setIsSalesReturn(false))
     } else {
-      requestSupervisorAction('Sales Return', toggleSalesReturn)
+      requestSupervisorAction('Sales Return', () => setIsSalesReturn(true))
     }
   }
 
@@ -734,6 +719,9 @@ function App() {
       selectedCustomer?.CUSTOMERCODE ??
       selectedCustomer?.customercode ??
       null
+    const list = Array.isArray(cartItems) ? cartItems : []
+    const syncReturnFlag =
+      isSalesReturn || list.some((i) => !i.void && Number(i.quantity) < 0)
     fetch(`${getApiBase()}/api/cart/sync`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -743,7 +731,7 @@ function App() {
         counterCode: counterCode || '',
         customerCode: cust != null && String(cust).trim() !== '' ? String(cust).trim() : null,
         items: cartItems,
-        isSalesReturn,
+        isSalesReturn: syncReturnFlag,
       }),
     }).catch(err => console.error('Cart sync failed:', err))
   }
@@ -759,9 +747,10 @@ function App() {
   const sameId = (a, b) => String(a ?? '') === String(b ?? '')
 
   const addToCart = (product) => {
+    const wasReturnMode = isSalesReturn
     const qtyDelta = isSalesReturn ? -1 : 1
     const useQty = product.isWeightedItem && product.quantity != null && product.quantity > 0
-      ? product.quantity
+      ? (isSalesReturn ? -Math.abs(product.quantity) : Math.abs(product.quantity))
       : qtyDelta
     setCart(prev => {
       const pid = getItemId(product)
@@ -783,6 +772,9 @@ function App() {
       syncCartToDb(newCart)
       return newCart
     })
+    if (wasReturnMode) {
+      setIsSalesReturn(false)
+    }
   }
 
   const removeFromCart = (productId) => {
@@ -795,10 +787,13 @@ function App() {
 
   const updateQuantity = useCallback((productId, quantity) => {
     const raw = Number(quantity)
-    const qty = isSalesReturn
-      ? (Number.isNaN(raw) ? 0 : raw)
-      : Math.max(0, Number(quantity) || 0)
     setCart(prev => {
+      const existing = prev.find((item) => sameId(getItemId(item), productId))
+      const lineIsReturn = existing && !existing.void && Number(existing.quantity) < 0
+      const treatAsReturn = isSalesReturn || lineIsReturn
+      const qty = treatAsReturn
+        ? (Number.isNaN(raw) ? 0 : raw)
+        : Math.max(0, Number(quantity) || 0)
       if (qty === 0) {
         const newCart = prev.filter(item => !sameId(getItemId(item), productId))
         syncCartToDb(newCart)
@@ -827,15 +822,111 @@ function App() {
     setSelectedCustomer(customer)
   }
 
+  /** Quick-add from POS: POST to Oracle CUSTOMER when online; else local row for billing. */
+  const handleRegisterQuickCustomer = async ({ name, mobile, qid, locationCode: locFromForm }) => {
+    const trimmedName = (name || '').trim()
+    if (!trimmedName) throw new Error('Please enter a name.')
+    const loc = String(locFromForm || locationCode || '').trim() || '001'
+    const mobileStr = String(mobile || '').trim()
+    const qidStr = String(qid || '').trim()
+
+    const applyLocalAdHocCustomer = () => {
+      const code = `POS${Date.now()}`
+      const row = {
+        CUSTOMERCODE: code,
+        customercode: code,
+        CUSTOMERNAME: trimmedName,
+        customername: trimmedName,
+        CUST_FULL_NAME: `${code} ${trimmedName}`.trim(),
+        cust_full_name: `${code} ${trimmedName}`.trim(),
+        MOBILE: mobileStr,
+        mobile: mobileStr,
+        QID: qidStr,
+        qid: qidStr,
+        FLAG: 'A',
+        flag: 'A',
+        INVOICECODE: 1,
+        invoicecode: 1,
+        CATEGORYNAME: 'RETAIL',
+        categoryname: 'RETAIL',
+        LOCATIONCODE: loc,
+        locationcode: loc,
+        CURRENTCREDITAMOUNT: 0,
+        currentcreditamount: 0,
+        CREDITLIMIT: 0,
+        creditlimit: 0,
+        POINTS: 0,
+        points: 0,
+        _posAdHoc: true,
+      }
+      setCustomers((prev) => {
+        const list = Array.isArray(prev) ? prev : []
+        return [row, ...list.filter((c) => String(c.CUSTOMERCODE ?? c.customercode ?? '') !== code)]
+      })
+      setSelectedCustomer(row)
+    }
+
+    try {
+      const res = await fetch(`${getApiBase()}/api/customers`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: trimmedName,
+          customerName: trimmedName,
+          mobile: mobileStr || null,
+          qid: qidStr || null,
+          locationCode: loc,
+        }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (res.ok && data?.ok && data?.customer) {
+        const merged = normalizeDefaultCustomerPayload(data.customer)
+        const code = String(merged.CUSTOMERCODE ?? merged.customercode ?? '').trim()
+        const row = {
+          ...merged,
+          MOBILE: mobileStr || merged.MOBILE || merged.mobile || '',
+          mobile: mobileStr || merged.mobile || merged.MOBILE || '',
+          QID: qidStr || merged.QID || merged.qid || '',
+          qid: qidStr || merged.qid || merged.QID || '',
+          CATEGORYNAME: merged.CATEGORYNAME ?? merged.categoryname ?? 'RETAIL',
+          categoryname: merged.categoryname ?? merged.CATEGORYNAME ?? 'RETAIL',
+          LOCATIONCODE: merged.LOCATIONCODE ?? merged.locationcode ?? loc,
+          locationcode: merged.locationcode ?? merged.LOCATIONCODE ?? loc,
+        }
+        setCustomers((prev) => {
+          const list = Array.isArray(prev) ? prev : []
+          return [row, ...list.filter((c) => String(c.CUSTOMERCODE ?? c.customercode ?? '') !== code)]
+        })
+        setSelectedCustomer(row)
+        return
+      }
+      if (res.status === 503) {
+        applyLocalAdHocCustomer()
+        return
+      }
+      throw new Error(data?.error || `Could not save customer (${res.status})`)
+    } catch (e) {
+      const msg = e && typeof e.message === 'string' ? e.message : String(e)
+      if (msg === 'Failed to fetch' || msg.includes('NetworkError')) {
+        applyLocalAdHocCustomer()
+        return
+      }
+      throw e instanceof Error ? e : new Error(msg)
+    }
+  }
+
   const goToPayment = () => {
     if (cart.length === 0) return
     const invoiceCode = selectedCustomer?.INVOICECODE ?? selectedCustomer?.invoicecode ?? null
     const isCreditCustomer = invoiceCode === 2 || invoiceCode === '2'
     if (selectedCustomer && isCreditCustomer) {
+      if (creditCheckoutInFlightRef.current) return
+      creditCheckoutInFlightRef.current = true
+      setCreditCheckoutLoading(true)
       const activeItems = cart.filter((item) => !item.void)
       const subtotal = activeItems.reduce((sum, item) => sum + (item.price ?? 0) * (item.quantity ?? 0), 0)
 
-      const total = subtotal 
+      const total = subtotal
       completePayment({
         paymentMethod: 'credit',
         amountTendered: 0,
@@ -843,6 +934,9 @@ function App() {
         total,
         subtotal,
         items: activeItems,
+      }).finally(() => {
+        creditCheckoutInFlightRef.current = false
+        setCreditCheckoutLoading(false)
       })
       return
     }
@@ -852,6 +946,9 @@ function App() {
   const completePayment = async (receiptData) => {
     let fetchedCurrentCredit = null
     let fetchedCreditLimit = null
+    const activeItems = cart.filter((item) => !item.void)
+    const payAsReturn =
+      isSalesReturn || activeItems.some((item) => Number(item.quantity) < 0)
 
     if (receiptData?.paymentMethod === 'credit' && selectedCustomer) {
       const custCode = selectedCustomer?.CUSTOMERCODE ?? selectedCustomer?.customercode ?? ''
@@ -865,17 +962,24 @@ function App() {
         fetchedCurrentCredit = Number(selectedCustomer.CURRENTCREDITAMOUNT ?? selectedCustomer.currentcreditamount ?? 0) || 0
         fetchedCreditLimit = Number(selectedCustomer.CREDITLIMIT ?? selectedCustomer.creditlimit ?? 0) || 0
       }
-      const billAmount = Math.abs(Number(receiptData.total ?? 0))
-      const newBalanceCredit = isSalesReturn
-        ? fetchedCurrentCredit - billAmount
-        : fetchedCurrentCredit + billAmount
+      let netTotal = Number(receiptData?.total)
+      if (Number.isNaN(netTotal)) {
+        netTotal = activeItems.reduce(
+          (sum, item) => sum + (item.price ?? 0) * (item.quantity ?? 0),
+          0
+        )
+      }
+      const billAmountAbs = Math.abs(netTotal)
+      const newBalanceCredit =
+        netTotal < 0
+          ? fetchedCurrentCredit - billAmountAbs
+          : fetchedCurrentCredit + billAmountAbs
       if (newBalanceCredit > fetchedCreditLimit) {
         alert('Contact accounts')
         return
       }
     }
 
-    const activeItems = cart.filter((item) => !item.void)
     const invoiceCode = selectedCustomer?.INVOICECODE ?? selectedCustomer?.invoicecode ?? null
     const netBillAmount = receiptData?.total ?? activeItems.reduce((sum, item) => sum + (item.price ?? 0) * (item.quantity ?? 0), 0)
     const customerCode = selectedCustomer?.CUSTOMERCODE ?? selectedCustomer?.customercode ?? ''
@@ -895,7 +999,7 @@ function App() {
       billNo,
       counterCode: counterCode || '',
       ...(sessionBillDate && /^\d{4}-\d{2}-\d{2}$/.test(sessionBillDate) ? { billDate: sessionBillDate } : {}),
-      isSalesReturn,
+      isSalesReturn: payAsReturn,
       invoiceCode: invoiceCode != null ? invoiceCode : undefined,
       totalPoints: cartTotalPoints,
       netBillAmount: netBillAmount != null ? Number(netBillAmount) : undefined,
@@ -958,7 +1062,7 @@ function App() {
             billDate: (sessionBillDate && /^\d{4}-\d{2}-\d{2}$/.test(sessionBillDate)
               ? sessionBillDate
               : new Date().toISOString().slice(0, 10)),
-            isSalesReturn,
+            isSalesReturn: payAsReturn,
           }),
         })
       } catch (e) {
@@ -999,7 +1103,7 @@ function App() {
         cardAmount: receiptData?.cardAmount,
         amountTendered: receiptData?.amountTendered ?? 0,
         change: receiptData?.change ?? 0,
-        isSalesReturn,
+        isSalesReturn: payAsReturn,
       })
     } catch (printErr) {
       console.error('[Receipt] Print failed:', printErr)
@@ -1027,6 +1131,7 @@ function App() {
     clearCart()
     setSelectedCartItemId(null)
     setSelectedCustomer(null)
+    setIsSalesReturn(false)
     await fetchAndSetNextBillNo()
     setShowPaymentPage(false)
   }
@@ -1148,8 +1253,8 @@ function App() {
                   onSelectCustomer={handleSelectCustomer}
                   onUpdateQuantity={updateQuantity}
                   onRemove={removeFromCart}
-                  onClear={clearCart}
                   onCheckout={goToPayment}
+                  checkoutLoading={creditCheckoutLoading}
                   onTotalPointsChange={setCartTotalPoints}
                   onLinePointsChange={setCartLinePoints}
                   onHold={() => requestSupervisorAction('Hold bill', handleHold)}
@@ -1165,6 +1270,7 @@ function App() {
                   counterCode={counterCode}
                   counterName={counterName}
                   billNo={billNo}
+                  onRegisterQuickCustomer={handleRegisterQuickCustomer}
                 />
               )}
               {activeView === 'customers' && canView('customers') && (

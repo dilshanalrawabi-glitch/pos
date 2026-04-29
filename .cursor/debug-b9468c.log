@@ -1,6 +1,0 @@
-{"sessionId":"b9468c","location":"Payment.jsx:useEffect:cart","message":"cart_totals","data":{"subtotal":4,"lineCount":1,"amountTendered":"","paymentMethod":"cash"},"timestamp":1774522979977,"hypothesisId":"H2"}
-{"sessionId":"b9468c","location":"Payment.jsx:useEffect:cart","message":"cart_totals","data":{"subtotal":12.5,"lineCount":2,"amountTendered":"","paymentMethod":"cash"},"timestamp":1774522980140,"hypothesisId":"H2"}
-{"sessionId":"b9468c","location":"Payment.jsx:handleKeypad:entry","message":"keypad","data":{"key":"2","paymentMethod":"cash","amountTenderedBefore":"","total":4,"amountNum":0,"cashApplied":0,"cardDue":4},"timestamp":1774523031857,"hypothesisId":"H1"}
-{"sessionId":"b9468c","location":"Payment.jsx:handleKeypad:beforeSet","message":"append","data":{"concatPreview":"2"},"timestamp":1774523031857,"hypothesisId":"H1"}
-{"sessionId":"b9468c","location":"Payment.jsx:handleKeypad:entry","message":"keypad","data":{"key":"2","paymentMethod":"cash","amountTenderedBefore":"2","total":4,"amountNum":2,"cashApplied":2,"cardDue":2},"timestamp":1774523033632,"hypothesisId":"H1"}
-{"sessionId":"b9468c","location":"Payment.jsx:handleKeypad:beforeSet","message":"append","data":{"concatPreview":"22"},"timestamp":1774523033633,"hypothesisId":"H1"}

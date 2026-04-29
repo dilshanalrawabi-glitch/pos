@@ -381,6 +381,7 @@ function CounterOpen({
               className="counter-setup-input"
               value={date}
               onChange={(e) => setDate(e.target.value)}
+              autoComplete="off"
             />
           </div>
           <div className="counter-setup-row">
@@ -392,6 +393,8 @@ function CounterOpen({
               value={shiftCode}
               onChange={(e) => setShiftCode(e.target.value)}
               placeholder="e.g. M, A, B"
+              autoComplete="off"
+              spellCheck={false}
             />
           </div>
           <div className="counter-setup-row counter-open-actions">

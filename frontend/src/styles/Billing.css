@@ -401,6 +401,19 @@
   cursor: not-allowed;
 }
 
+.dashboard-actions-card .pos-action-btn-return-active {
+  background: #fef3c7;
+  border-color: #f59e0b;
+  color: #92400e;
+}
+
+.dashboard-actions-card .pos-action-btn-return-active:hover:not(:disabled),
+.dashboard-actions-card .pos-action-btn-return-active:focus-visible:not(:disabled) {
+  background: #fde68a;
+  border-color: #d97706;
+  color: #78350f;
+}
+
 /* Primary (Pay) – full width, teal background */
 .dashboard-actions-card .pos-action-btn-primary {
   grid-column: 1 / -1;
@@ -424,6 +437,23 @@
   transform: scale(0.98);
 }
 
+@keyframes pos-action-pay-loader-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.dashboard-actions-card .pos-action-pay-loader {
+  display: inline-block;
+  width: 20px;
+  height: 20px;
+  border: 3px solid rgba(255, 255, 255, 0.35);
+  border-radius: 50%;
+  border-top-color: #fff;
+  animation: pos-action-pay-loader-spin 0.8s linear infinite;
+  vertical-align: middle;
+}
+
 /* Secondary (Hold, Hold Retrieve) – light teal background */
 .dashboard-actions-card .pos-action-btn-secondary {
   background: #99f6e4;
@@ -442,6 +472,18 @@
 .dashboard-actions-card .pos-action-btn-secondary:active:not(:disabled) {
   background: #2dd4bf;
   transform: scale(0.98);
+}
+
+.dashboard-actions-card .pos-action-btn-qty-step {
+  padding: 10px 12px;
+}
+
+.dashboard-actions-card .pos-action-qty-step-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 0;
+  color: inherit;
 }
 
 /* Void Line – Red (maximum super) */
@@ -641,7 +683,7 @@ body.keyboard-open .qty-modal {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 16px 20px;
+  padding: 14px;
   border-bottom: 1px solid #e2e8f0;
 }
 
@@ -667,7 +709,7 @@ body.keyboard-open .qty-modal {
 }
 
 .qty-modal-body {
-  padding: 16px 20px;
+  padding: 14px;
   overflow-y: auto;
 }
 
@@ -832,6 +874,77 @@ body.keyboard-open .qty-modal {
 .qty-keypad-ok:hover {
   background: #0d5c56;
   border-color: #0d5c56;
+}
+
+/* Customer add modal (Billing – POS action) */
+.customer-add-modal.qty-modal {
+  min-width: min(400px, 92vw);
+}
+
+.customer-add-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.customer-add-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+}
+
+.customer-add-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: #475569;
+}
+
+.customer-add-input {
+  margin: 0;
+}
+
+.customer-add-error {
+  margin: 0;
+  font-size: 13px;
+  color: #b91c1c;
+}
+
+.customer-add-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
+  margin-top: 4px;
+}
+
+.customer-add-btn-cancel,
+.customer-add-btn-save {
+  padding: 10px 18px;
+  border-radius: 8px;
+  font-weight: 600;
+  font-size: 14px;
+  cursor: pointer;
+  border: 1px solid #e2e8f0;
+}
+
+.customer-add-btn-cancel {
+  background: #f8fafc;
+  color: #475569;
+}
+
+.customer-add-btn-cancel:hover {
+  background: #f1f5f9;
+}
+
+.customer-add-btn-save {
+  background: #0f766e;
+  color: white;
+  border-color: #0f766e;
+}
+
+.customer-add-btn-save:hover {
+  background: #0d9488;
+  border-color: #0d9488;
 }
 
 

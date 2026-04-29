@@ -37,7 +37,7 @@
   grid-template-columns: 280px 1fr;
   gap: 0;
   width: 50%;
-  margin: 10px auto 0;
+  margin: 0 auto;
   border-radius: 12px;
   overflow: hidden;
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.08);
@@ -245,7 +245,7 @@
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
   min-height: 0;
   border-radius: 0 12px 12px 0;
   box-sizing: border-box;
@@ -500,8 +500,9 @@ button.payment-entered-col-card.payment-entered-col-click.payment-entered-col-ac
 
 .payment-continue-card {
   display: flex;
-  align-items: flex-start;
-  gap: 10px;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
   margin: 0;
   padding: 4px 0 0;
   font-size: 12px;
@@ -513,10 +514,12 @@ button.payment-entered-col-card.payment-entered-col-click.payment-entered-col-ac
 }
 
 .payment-continue-card input {
-  margin-top: 2px;
+  margin: 0;
   flex-shrink: 0;
-  width: 16px;
-  height: 16px;
+  width: 20px;
+  height: 20px;
+  min-width: 20px;
+  min-height: 20px;
   accent-color: #0f766e;
   cursor: pointer;
 }
@@ -563,16 +566,16 @@ button.payment-entered-col-card.payment-entered-col-click.payment-entered-col-ac
   gap: 10px;
   justify-content: center;
   width: 100%;
-  max-width: 170px;
+  max-width: 228px;
 }
 
 .payment-key {
-  width: 50px;
-  height: 44px;
+  width: 66px;
+  height: 54px;
   background: #475569;
   border: none;
-  border-radius: 8px;
-  font-size: 17px;
+  border-radius: 10px;
+  font-size: 20px;
   font-weight: 600;
   color: white;
   cursor: pointer;
@@ -588,7 +591,7 @@ button.payment-entered-col-card.payment-entered-col-click.payment-entered-col-ac
 }
 
 .payment-key.key-back {
-  font-size: 18px;
+  font-size: 20px;
 }
 
 .payment-pay-btn {

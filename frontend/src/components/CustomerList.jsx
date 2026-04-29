@@ -40,6 +40,8 @@ function CustomerList({ customers = [] }) {
           placeholder="Search by name or code..."
           value={searchQuery}
           onChange={(e) => setSearchQuery(e.target.value)}
+          autoComplete="off"
+          spellCheck={false}
         />
       </header>
       <div className="customer-list-content">

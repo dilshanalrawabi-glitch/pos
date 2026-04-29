@@ -408,7 +408,7 @@ function Payment({
                 checked={continueBalanceOnCard}
                 onChange={(e) => setContinueBalanceOnCard(e.target.checked)}
               />
-              <span>Continue balance on card (split payment)</span>
+              <span>Card + Cash</span>
             </label>
           )}
           <button

@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef, useEffect, useLayoutEffect } from 'react'
 import '../styles/CartSummary.css'
 import { useKeyboard } from '../context/KeyboardContext'
 import cartIcon from '../assets/cart-icon.png'
@@ -23,8 +23,8 @@ function CartSummary({
   cartItems,
   onUpdateQuantity,
   onRemove,
-  onClear,
   onCheckout,
+  checkoutLoading = false,
   billNo,
   products = [],
   onAddToCart,
@@ -148,11 +148,9 @@ function CartSummary({
     return () => clearTimeout(t)
   }, [scanMsg])
 
-  useEffect(() => {
-    const id = requestAnimationFrame(() => {
-      scanInputRef.current?.focus()
-    })
-    return () => cancelAnimationFrame(id)
+  // Default focus for wedge scanners before first paint; field stays writable (no readOnly gate).
+  useLayoutEffect(() => {
+    scanInputRef.current?.focus({ preventScroll: true })
   }, [])
 
   // When cart has more than 5 lines, scroll so the newest / last line stays visible after add or qty merge on last line
@@ -320,22 +318,21 @@ function CartSummary({
             </div>
           </>
         )}
-        {cartItems.length > 0 && (
-          <button className="clear-btn" onClick={onClear}>Clear</button>
-        )}
       </div>
 
       <div className="cart-scan-block">
-        <form className="cart-scan-form" onSubmit={handleScanSubmit}>
+        <form className="cart-scan-form" onSubmit={handleScanSubmit} autoComplete="off">
           <div className="cart-scan-row">
             <input
               ref={scanInputRef}
               type="text"
+              name="cartScan"
               placeholder="Barcode or code"
               value={scanCode}
               onChange={(e) => setScanCode(e.target.value)}
               className="cart-scan-input"
               autoComplete="off"
+              spellCheck={false}
               data-no-osk="true"
             />
             <button
@@ -426,7 +423,7 @@ function CartSummary({
                     <span className="cart-td cart-td-uom">{uom}</span>
                     <span className="cart-td cart-td-qty">{formatQty(item.quantity)}</span>
                     <span className="cart-td cart-td-price">{item.price.toFixed(2)}</span>
-                    <span className="cart-td cart-td-discount">{discount > 0 ? `${discount.toFixed(2)}` : '—'}</span>
+                    <span className="cart-td cart-td-discount">{discount.toFixed(2)}</span>
                     <span className="cart-td cart-td-amount">{lineTotal.toFixed(2)}</span>
                     <span className="cart-td cart-td-point">{typeof pointDisplay === 'number' && Number.isFinite(pointDisplay) ? pointDisplay.toFixed(3) : '0.000'}</span>
                     <span className="cart-td cart-td-factor">{formatNum(factor)}</span>
@@ -457,8 +454,13 @@ function CartSummary({
             <span>Total:</span>
             <span>QAR {(totalDisplay).toFixed(2)}</span>
           </div>
-          <button className="checkout-btn" onClick={onCheckout}>
-            Checkout
+          <button
+            type="button"
+            className="checkout-btn"
+            onClick={onCheckout}
+            disabled={checkoutLoading}
+          >
+            {checkoutLoading ? <span className="cart-checkout-loader" aria-hidden="true" /> : 'Checkout'}
           </button>
         </div>
       )}

@@ -8,6 +8,8 @@ const COMPANY_KEY = 'pos_company_name'
 const COMPANY_AR_KEY = 'pos_company_name_ar'
 const BRANCH_KEY = 'pos_branch_name'
 const ENCODING_KEY = 'pos_receipt_encoding'
+const DRAWER_ENABLE_KEY = 'pos_cash_drawer_enabled'
+const DRAWER_PIN_KEY = 'pos_cash_drawer_pin'
 
 const ENCODING_OPTIONS = [
   { value: 'IBM864', label: 'IBM864 (Arabic – Epson)' },
@@ -24,6 +26,12 @@ export default function PrinterSettings() {
   const [companyNameAr, setCompanyNameAr] = useState(() => localStorage.getItem(COMPANY_AR_KEY) || '')
   const [branchName, setBranchName] = useState(() => localStorage.getItem(BRANCH_KEY) || '')
   const [encoding, setEncoding] = useState(() => localStorage.getItem(ENCODING_KEY) || 'IBM864')
+  const [drawerEnabled, setDrawerEnabled] = useState(() => {
+    const v = localStorage.getItem(DRAWER_ENABLE_KEY)
+    if (v === '0' || v === 'false') return false
+    return true
+  })
+  const [drawerPin, setDrawerPin] = useState(() => (localStorage.getItem(DRAWER_PIN_KEY) === '1' ? '1' : '0'))
   const [certError, setCertError] = useState(null)
 
   const downloadQzCert = async (kind) => {
@@ -108,6 +116,8 @@ export default function PrinterSettings() {
         value={companyName}
         onChange={(e) => { setCompanyName(e.target.value); saveCompany(COMPANY_KEY, e.target.value) }}
         placeholder="e.g. RAWABI FOOD INTERNATIONAL"
+        autoComplete="off"
+        spellCheck={false}
       />
       <label className="printer-settings-label">Company name (Arabic)</label>
       <input
@@ -116,6 +126,8 @@ export default function PrinterSettings() {
         value={companyNameAr}
         onChange={(e) => { setCompanyNameAr(e.target.value); saveCompany(COMPANY_AR_KEY, e.target.value) }}
         placeholder="e.g. شركة الروابي للأغذية العالمية"
+        autoComplete="off"
+        spellCheck={false}
       />
       <label className="printer-settings-label">Branch / location line</label>
       <input
@@ -124,6 +136,8 @@ export default function PrinterSettings() {
         value={branchName}
         onChange={(e) => { setBranchName(e.target.value); saveCompany(BRANCH_KEY, e.target.value) }}
         placeholder="e.g. Branch - Counter name"
+        autoComplete="off"
+        spellCheck={false}
       />
 
       <h3 className="printer-settings-section">QZ Tray signing (no &quot;Untrusted website&quot; prompt)</h3>
@@ -197,6 +211,42 @@ export default function PrinterSettings() {
       )}
       {!loading && !error && printers.length === 0 && (
         <p className="printer-settings-empty">No printers found. Connect a USB thermal printer and ensure QZ Tray is running.</p>
+      )}
+      {!loading && (
+        <>
+          <h3 className="printer-settings-section">Cash drawer</h3>
+          <p className="printer-settings-desc">
+            Plug the drawer into the <strong>receipt printer</strong> kick port (RJ11). On a completed sale that includes{' '}
+            <strong>cash</strong> (including split with cash), the POS sends an Epson-style ESC/POS pulse before the paper cut.
+            Card-only, credit, and <strong>reprinted</strong> receipts do not open the drawer.
+          </p>
+          <label className="printer-settings-label" style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
+            <input
+              type="checkbox"
+              checked={drawerEnabled}
+              onChange={(e) => {
+                const on = e.target.checked
+                setDrawerEnabled(on)
+                localStorage.setItem(DRAWER_ENABLE_KEY, on ? '1' : '0')
+              }}
+            />
+            Open cash drawer on sale (when payment includes cash)
+          </label>
+          <label className="printer-settings-label">Drawer kick pin (Epson-style)</label>
+          <p className="printer-settings-desc">If the drawer does not open, try the other pin. Star or other brands may need different commands.</p>
+          <select
+            className="printer-settings-select"
+            value={drawerPin}
+            onChange={(e) => {
+              const v = e.target.value
+              setDrawerPin(v)
+              localStorage.setItem(DRAWER_PIN_KEY, v)
+            }}
+          >
+            <option value="0">Pin 2 (most common)</option>
+            <option value="1">Pin 5</option>
+          </select>
+        </>
       )}
     </div>
   )

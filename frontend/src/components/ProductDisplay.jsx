@@ -5,7 +5,6 @@ const POS_BUTTONS = [
   { id: 'sales-return', label: 'Sales Return', desc: 'Sales return' },
   { id: 'hold', label: 'Hold', desc: 'Hold bill' },
   { id: 'hold-retrieve', label: 'Hold Retrieve', desc: 'Release held bill' },
-  { id: 'discount', label: 'Discount', desc: 'Apply discount' },
   { id: 'pay', label: 'Pay', desc: 'Proceed to payment' },
 ]
 
@@ -38,6 +37,7 @@ function mapLookupToProduct(p) {
 function ProductDisplay({ products, onAddToCart, cartItems, onPosAction, onHold, onHoldRetrieve, apiBase }) {
   const [scanCode, setScanCode] = useState('')
   const [scanMsg, setScanMsg] = useState(null)
+  const [scanFieldEditable, setScanFieldEditable] = useState(false)
   const scanInputRef = useRef(null)
 
   useEffect(() => {
@@ -93,14 +93,13 @@ function ProductDisplay({ products, onAddToCart, cartItems, onPosAction, onHold,
     }
     if (onPosAction) onPosAction(id)
     else if (id === 'sales-return') alert('Sales Return – process sales return')
-    else if (id === 'discount') alert('Discount – apply discount')
     else if (id === 'pay') alert('Pay – proceed to payment')
   }
 
   return (
     <div className="product-display">
       <div className="search-scanner-bar">
-        <form className="scan-form" onSubmit={handleScanSubmit}>
+        <form className="scan-form" onSubmit={handleScanSubmit} autoComplete="off">
           <label htmlFor="scan-barcode" className="scan-label">Scan barcode / Enter code</label>
           <input
             id="scan-barcode"
@@ -111,6 +110,9 @@ function ProductDisplay({ products, onAddToCart, cartItems, onPosAction, onHold,
             onChange={(e) => setScanCode(e.target.value)}
             className="scan-input"
             autoComplete="off"
+            spellCheck={false}
+            readOnly={!scanFieldEditable}
+            onFocus={() => setScanFieldEditable(true)}
           />
           {scanMsg && <span className="scan-msg">{scanMsg}</span>}
         </form>

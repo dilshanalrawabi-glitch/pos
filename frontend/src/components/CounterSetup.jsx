@@ -108,7 +108,7 @@ function CounterSetup({ counterCode, counterName, locationCode, apiBase, onSave,
         <h2>Counter Setup</h2>
       </div>
 
-      <form className="counter-setup-form" onSubmit={handleSubmit}>
+      <form className="counter-setup-form" onSubmit={handleSubmit} autoComplete="off">
         <section className="counter-setup-section">
           <h3>System info (from launcher)</h3>
           <div className="counter-setup-row">
@@ -119,6 +119,7 @@ function CounterSetup({ counterCode, counterName, locationCode, apiBase, onSave,
               value={systemName}
               readOnly
               placeholder="Set by launcher when opened via POS launcher"
+              autoComplete="off"
             />
           </div>
           <div className="counter-setup-row">
@@ -129,6 +130,7 @@ function CounterSetup({ counterCode, counterName, locationCode, apiBase, onSave,
               value={ipAddress}
               readOnly
               placeholder="Set by launcher when opened via POS launcher"
+              autoComplete="off"
             />
           </div>
         </section>
@@ -148,6 +150,7 @@ function CounterSetup({ counterCode, counterName, locationCode, apiBase, onSave,
                 readOnly
                 placeholder="From DB: last COUNTERCODE + 1"
                 aria-label="Counter code (from database)"
+                autoComplete="off"
               />
             )}
           </div>
@@ -161,6 +164,8 @@ function CounterSetup({ counterCode, counterName, locationCode, apiBase, onSave,
               readOnly={hasExistingCounter}
               onChange={(e) => setName(e.target.value)}
               placeholder="e.g. Counter 1"
+              autoComplete="off"
+              spellCheck={false}
             />
           </div>
         </section>

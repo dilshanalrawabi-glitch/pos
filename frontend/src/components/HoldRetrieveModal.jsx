@@ -1,10 +1,18 @@
-import { useState } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import '../styles/HoldRetrieveModal.css'
 
 export default function HoldRetrieveModal({ open, onClose, locationCode, apiBase, onRetrieve }) {
   const [billNoInput, setBillNoInput] = useState('')
+  const [billNoEditable, setBillNoEditable] = useState(false)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
+  const billInputRef = useRef(null)
+
+  useEffect(() => {
+    if (!open) return
+    const id = window.setTimeout(() => billInputRef.current?.focus(), 100)
+    return () => window.clearTimeout(id)
+  }, [open])
 
   const handleRetrieve = async (e) => {
     e?.preventDefault()
@@ -29,6 +37,7 @@ export default function HoldRetrieveModal({ open, onClose, locationCode, apiBase
       onRetrieve(data.billNo, data.items || [])
       await fetch(`${apiBase}/api/hold/${billNoNum}?locationCode=${loc}`, { method: 'DELETE' })
       setBillNoInput('')
+      setBillNoEditable(false)
       onClose()
     } catch (err) {
       setError(err.message || 'Failed to retrieve bill')
@@ -39,6 +48,7 @@ export default function HoldRetrieveModal({ open, onClose, locationCode, apiBase
 
   const handleClose = () => {
     setBillNoInput('')
+    setBillNoEditable(false)
     setError(null)
     onClose()
   }
@@ -55,12 +65,14 @@ export default function HoldRetrieveModal({ open, onClose, locationCode, apiBase
           </button>
         </div>
         <div className="hold-retrieve-body">
-          <form className="hold-retrieve-form" onSubmit={handleRetrieve}>
+          <form className="hold-retrieve-form" onSubmit={handleRetrieve} autoComplete="off">
             <label htmlFor="hold-retrieve-billno" className="hold-retrieve-label">
               Bill number
             </label>
             <input
+              ref={billInputRef}
               id="hold-retrieve-billno"
+              name="hold-retrieve-billno"
               type="text"
               inputMode="numeric"
               placeholder="Enter bill number"
@@ -70,7 +82,10 @@ export default function HoldRetrieveModal({ open, onClose, locationCode, apiBase
                 setError(null)
               }}
               className="hold-retrieve-input"
-              autoFocus
+              autoComplete="off"
+              spellCheck={false}
+              readOnly={!billNoEditable}
+              onFocus={() => setBillNoEditable(true)}
               disabled={loading}
             />
             {error && <p className="hold-retrieve-error">{error}</p>}

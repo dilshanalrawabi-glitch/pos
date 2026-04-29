@@ -133,6 +133,14 @@ body.keyboard-open .login-page {
   opacity: 0.95;
 }
 
+.login-btn:focus {
+  outline: none;
+}
+
+.login-btn:focus-visible {
+  box-shadow: 0 0 0 3px rgba(15, 118, 110, 0.45);
+}
+
 .login-btn:disabled {
   opacity: 0.7;
   cursor: not-allowed;

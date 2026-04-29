@@ -718,8 +718,271 @@ def add_user():
     }), 201
 
 
-@app.route('/api/customers', methods=['GET'])
+def _customer_bind_location_code(location_code):
+    """Bind LOCATIONCODE as NUMBER when the value is all digits (common legacy schema), else string."""
+    s = str(location_code).strip() if location_code is not None else ''
+    if not s:
+        return s
+    if s.isdigit():
+        try:
+            return int(s)
+        except (TypeError, ValueError):
+            return s
+    return s
+
+
+def _default_customercategory_code(cur):
+    """First TBLCUSTOMERCATEGORY.CATEGORYCODE for new rows (NOT NULL FK on many schemas)."""
+    try:
+        cur.execute('SELECT TRIM(categorycode) FROM tblcustomercategory WHERE ROWNUM = 1')
+        row = cur.fetchone()
+        if row and row[0] is not None:
+            c = str(row[0]).strip()
+            if c:
+                return c
+    except oracledb.Error:
+        pass
+    return None
+
+
+def _next_customercode_plus_one(cur):
+    """
+    Next CUSTOMERCODE = MAX(existing) + 1.
+    Tries NUMBER column first, then all-numeric VARCHAR2 codes (ignores alphanumeric like C001).
+    """
+    for sql in (
+        'SELECT NVL(MAX(customercode), 0) + 1 FROM customer',
+        """
+        SELECT NVL(MAX(TO_NUMBER(TRIM(customercode))), 0) + 1 FROM customer
+        WHERE REGEXP_LIKE(TRIM(customercode), '^[0-9]+$')
+        """,
+    ):
+        try:
+            cur.execute(sql)
+            row = cur.fetchone()
+            if not row or row[0] is None:
+                continue
+            v = row[0]
+            if type(v).__name__ == 'Decimal':
+                return int(v)
+            return int(v)
+        except oracledb.Error as e:
+            err = str(e).upper()
+            if 'ORA-00904' in err or '00904' in err or 'ORA-01722' in err or '01722' in err or 'ORA-00932' in err or '00932' in err:
+                continue
+            raise
+    return 1
+
+
+def _qid_nationality_code_digits(qid):
+    """Qatar-style QID: digits 4–6 (1-based) are nationality code (e.g. 12345678901 -> 456)."""
+    if not qid:
+        return None
+    digits = ''.join(ch for ch in str(qid) if ch.isdigit())
+    if len(digits) < 6:
+        return None
+    return digits[3:6]
+
+
+def _nationality_name_from_tblnationality(cur, nationality_code):
+    """TBLNATIONALITY.NAME for CODE = nationality_code (numeric or varchar CODE column)."""
+    if not nationality_code:
+        return None
+    code_s = str(nationality_code).strip()
+    if not code_s:
+        return None
+    for sql in (
+        """
+        SELECT TRIM(n.name) FROM tblnationality n
+        WHERE TRIM(TO_CHAR(n.code)) = :c AND ROWNUM = 1
+        """,
+        """
+        SELECT TRIM(n.name) FROM tblnationality n
+        WHERE TRIM(n.code) = :c AND ROWNUM = 1
+        """,
+    ):
+        try:
+            cur.execute(sql, {'c': code_s})
+            row = cur.fetchone()
+            if row and row[0] is not None:
+                name = str(row[0]).strip()
+                if name:
+                    return name
+        except oracledb.Error:
+            continue
+    return None
+
+
+def _customers_post_create():
+    """Insert a new CUSTOMER row from POS (Customer add). CUSTOMERCODE = MAX + 1."""
+    data = request.get_json(silent=True) or {}
+    cname = (data.get('customerName') or data.get('customername') or data.get('name') or '').strip()
+    mobile = (data.get('mobile') or data.get('MOBILE') or '').strip() or None
+    qid = (data.get('qid') or data.get('QID') or data.get('QIDNO') or data.get('qidno') or '').strip() or None
+    loc_raw = (data.get('locationCode') or data.get('locationcode') or data.get('LOCATIONCODE') or '').strip()
+    if not cname:
+        return jsonify({'ok': False, 'error': 'Customer name is required'}), 400
+    if not loc_raw:
+        return jsonify({'ok': False, 'error': 'locationCode is required'}), 400
+
+    conn = _get_connection()
+    if not conn:
+        return jsonify({'ok': False, 'error': 'Database unavailable'}), 503
+
+    cur = None
+    try:
+        cur = conn.cursor()
+        cat = _default_customercategory_code(cur)
+        next_num = _next_customercode_plus_one(cur)
+        loc_bind = _customer_bind_location_code(loc_raw)
+        nat_code = _qid_nationality_code_digits(qid) if qid else None
+        nat_name = _nationality_name_from_tblnationality(cur, nat_code) if nat_code else None
+        if nat_code and not nat_name:
+            print(f'[CustomerCreate] TBLNATIONALITY: no NAME for CODE={nat_code!r} (from QID)')
+
+        # Prefer numeric bind for numeric CUSTOMERCODE columns; fall back to string.
+        code_binds = (next_num, str(next_num))
+
+        # Extra trailing columns (literals / binds) — many schemas require CUSTOMERCATEGORY / FLAG.
+        extra_variants = (
+            (
+                ['FLAG', 'INVOICECODE', 'CUSTOMERCATEGORY', 'POINTS', 'CURRENTCREDITAMOUNT', 'CREDITLIMIT'],
+                ["'A'", '1', ':cat', '0', '0', '0'],
+                True,
+            ),
+            (
+                ['FLAG', 'INVOICECODE', 'CUSTOMERCATEGORY'],
+                ["'A'", '1', ':cat'],
+                True,
+            ),
+            (
+                ['FLAG', 'INVOICECODE'],
+                ["'A'", '1'],
+                False,
+            ),
+            (
+                ['FLAG'],
+                ["'A'"],
+                False,
+            ),
+            ([], [], False),
+        )
+        # None = no QID column in INSERT (table may not have QID* / NATIONALID).
+        qid_options = ('QID', 'QIDNO', 'NATIONALID', None)
+        # Resolved from QID digits + TBLNATIONALITY; try column names then omit if absent.
+        nat_col_options = (
+            ('NATIONALITY', 'NATIONALITYNAME', None)
+            if nat_name
+            else (None,)
+        )
+
+        last_err = None
+        for ccode in code_binds:
+            for qcol in qid_options:
+                for extra_cols, extra_placeholders, needs_cat in extra_variants:
+                    if needs_cat and not cat:
+                        continue
+                    for nat_col in nat_col_options:
+                        cols = ['LOCATIONCODE', 'CUSTOMERCODE', 'CUSTOMERNAME', 'MOBILE']
+                        vals = [':loc', ':ccode', ':cname', ':mobile']
+                        binds = {'loc': loc_bind, 'ccode': ccode, 'cname': cname, 'mobile': mobile}
+                        if qcol:
+                            cols.append(qcol)
+                            vals.append(':qid')
+                            binds['qid'] = qid
+                        cols.extend(extra_cols)
+                        vals.extend(extra_placeholders)
+                        if ':cat' in extra_placeholders:
+                            binds['cat'] = cat
+                        if nat_col:
+                            cols.append(nat_col)
+                            vals.append(':nation')
+                            binds['nation'] = nat_name
+                        cols.append('CREATEDDATE')
+                        vals.append('SYSDATE')
+                        ins = 'INSERT INTO customer ({}) VALUES ({})'.format(
+                            ', '.join(cols),
+                            ', '.join(vals),
+                        )
+                        try:
+                            cur.execute(ins, binds)
+                            conn.commit()
+                            code_for_fetch = str(ccode).strip()
+                            row = _customer_row_for_pos(cur, code_for_fetch) if code_for_fetch else None
+                            if row:
+                                if qid:
+                                    row['QID'] = qid
+                                    row['qid'] = qid
+                                if nat_name:
+                                    row['NATIONALITY'] = nat_name
+                                    row['nationality'] = nat_name
+                                return jsonify({'ok': True, 'customer': row}), 201
+                            # Row inserted but shape query failed — return minimal payload
+                            minimal = {
+                                'LOCATIONCODE': loc_raw,
+                                'locationcode': loc_raw,
+                                'CUSTOMERCODE': code_for_fetch,
+                                'customercode': code_for_fetch,
+                                'CUSTOMERNAME': cname,
+                                'customername': cname,
+                                'CUST_FULL_NAME': f'{code_for_fetch} {cname}'.strip(),
+                                'cust_full_name': f'{code_for_fetch} {cname}'.strip(),
+                                'MOBILE': mobile or '',
+                                'mobile': mobile or '',
+                                'QID': qid or '',
+                                'qid': qid or '',
+                                'FLAG': 'A',
+                                'flag': 'A',
+                                'INVOICECODE': 1,
+                                'invoicecode': 1,
+                                'POINTS': 0,
+                                'points': 0,
+                            }
+                            if nat_name:
+                                minimal['NATIONALITY'] = nat_name
+                                minimal['nationality'] = nat_name
+                            return jsonify({'ok': True, 'customer': minimal}), 201
+                        except oracledb.Error as e:
+                            try:
+                                conn.rollback()
+                            except Exception:
+                                pass
+                            err = str(e).upper()
+                            last_err = e
+                            if 'ORA-00904' in err or '00904' in err:
+                                continue
+                            if 'ORA-00932' in err or '00932' in err:
+                                continue
+                            if 'ORA-01400' in err or '01400' in err:
+                                continue
+                            if 'ORA-00001' in err or '00001' in err:
+                                return jsonify({'ok': False, 'error': 'Duplicate or conflicting customer data'}), 409
+                            print(f'[CustomerCreate] insert error: {e}')
+                            return jsonify({'ok': False, 'error': str(e)}), 500
+
+        if last_err:
+            conn.rollback()
+            return jsonify({'ok': False, 'error': str(last_err)}), 500
+        conn.rollback()
+        return jsonify({'ok': False, 'error': 'Could not insert customer (schema mismatch)'}), 500
+    finally:
+        if cur:
+            try:
+                cur.close()
+            except Exception:
+                pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.route('/api/customers', methods=['GET', 'POST', 'OPTIONS'])
 def get_customers():
+    if request.method == 'OPTIONS':
+        return '', 204
+    if request.method == 'POST':
+        return _customers_post_create()
     try:
         # Establish connection
         connection = oracledb.connect(
@@ -930,15 +1193,20 @@ def _is_category_type_h(cur, category_code):
 def get_price_after_category_check(cur, category_code, price_value, from_itemmaster_or_alternate):
     """
     When price is fetched and the item comes from ITEMMASTER or ITEMALTERNATEUOMMAP,
-    only show price if CATEGORY has CODE = category_code, FLAG = 'C', CATEGORYTYPE = 'G'.
+    only show price if CATEGORY allows it:
+    - FLAG = 'C' and CATEGORYTYPE = 'G' (general retail), or
+    - CATEGORYTYPE = 'H' (vegetable/meat by weight: PLU-only scan should still expose unit retail from DB;
+      encoded-price barcodes are handled separately via _try_vegetable_meat_barcode).
     Returns price_value if eligible, else None (do not show price).
     If from_itemmaster_or_alternate is False, returns price_value unchanged.
     """
     if not from_itemmaster_or_alternate:
         return price_value
-    if not _is_category_eligible_for_price(cur, category_code):
-        return None
-    return price_value
+    if _is_category_eligible_for_price(cur, category_code):
+        return price_value
+    if _is_category_type_h(cur, category_code):
+        return price_value
+    return None
 
 
 def _truncate_2dp(x):
@@ -3382,9 +3650,7 @@ def _customer_row_for_pos(cur, customer_code):
     code_s = str(customer_code).strip() if customer_code is not None else ''
     if not code_s:
         return None
-    try:
-        cur.execute(
-            """
+    base_sql = """
             SELECT
                 c.locationcode,
                 c.customercode,
@@ -3399,16 +3665,39 @@ def _customer_row_for_pos(cur, customer_code):
             FROM customer c
             LEFT JOIN tblcustomercategory g ON c.customercategory = g.categorycode
             WHERE TRIM(c.customercode) = TRIM(:code) AND ROWNUM = 1
-            """,
-            {'code': code_s},
-        )
-        row = cur.fetchone()
-        if not row:
+            """
+    nat_sql = """
+            SELECT
+                c.locationcode,
+                c.customercode,
+                c.customercode || ' ' || c.customername AS cust_full_name,
+                NVL(TRIM(g.categoryname), '') AS categoryname,
+                c.flag,
+                c.invoicecode,
+                c.currentcreditamount,
+                c.creditlimit,
+                NVL(c.points, 0) AS points,
+                NVL(TRIM(c.mobile), '') AS mobile,
+                NVL(TRIM(c.nationality), '') AS nationality
+            FROM customer c
+            LEFT JOIN tblcustomercategory g ON c.customercategory = g.categorycode
+            WHERE TRIM(c.customercode) = TRIM(:code) AND ROWNUM = 1
+            """
+    binds = {'code': code_s}
+    for sql in (nat_sql, base_sql):
+        try:
+            cur.execute(sql, binds)
+            row = cur.fetchone()
+            if not row:
+                return None
+            columns = [col[0] for col in cur.description]
+            return _row_dict_json_safe(dict(zip(columns, row)))
+        except oracledb.Error as e:
+            err = str(e).upper()
+            if sql is nat_sql and ('ORA-00904' in err or '00904' in err):
+                continue
             return None
-        columns = [col[0] for col in cur.description]
-        return _row_dict_json_safe(dict(zip(columns, row)))
-    except oracledb.Error:
-        return None
+    return None
 
 
 @app.route('/api/billing/default-customer', methods=['GET', 'OPTIONS'])
@@ -4447,7 +4736,7 @@ def credit_settlement_insert():
             """
             INSERT INTO TBLCREDITSETTLEMENT
             (LOCATIONCODE, PFLAG, FLAG, EMPLOYEECODE, BALANCE, STATUS, SALESMANCODE, CUSTOMERCODE, BILLAMOUNT, BILLDATE, BILLNO, PENDINGNO)
-            VALUES (:loc, 'N', 'B', :empcode, :balance, 'pending', :salesmancode, :custcode, :billamount, TO_DATE(:billdate, 'YYYY-MM-DD'), :billno, :pendingno)
+            VALUES (:loc, 'N', 'B', :empcode, :balance, 'PENDING', :salesmancode, :custcode, :billamount, TO_DATE(:billdate, 'YYYY-MM-DD'), :billno, :pendingno)
             """,
             {
                 "loc": location_code,
@@ -4465,7 +4754,7 @@ def credit_settlement_insert():
             """
             INSERT INTO TBLCRSETTLEMENT
             (LOCATIONCODE, PENDINGNO, BILLNUMBER, BILLDATE, BILLAMOUNT, CUSTOMERCODE, SALESMANCODE, FLAG, PUSER, STATUS)
-            VALUES (:loc, :pendingno, :billno, TO_DATE(:billdate, 'YYYY-MM-DD'), :billamount, :custcode, 1, 'B', :puser, 'pending')
+            VALUES (:loc, :pendingno, :billno, TO_DATE(:billdate, 'YYYY-MM-DD'), :billamount, :custcode, 1, 'B', :puser, 'PENDING')
             """,
             {
                 "loc": location_code,
