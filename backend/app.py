@@ -2366,6 +2366,27 @@ def _to_float(val, default=0.0):
         return default
 
 
+def _cart_quantity_from_item(it):
+    """Line quantity for TEMPBILLDTL / display: supports fractional kg (weighted veg/meat) and piece counts.
+    Must not use ``x or y`` (0 would be skipped) and must not use int() (0.35 kg would become 0)."""
+    if not isinstance(it, dict):
+        return 1.0
+    for key in ('quantity', 'qty', 'QUANTITY', 'weightKg', 'WEIGHTKG'):
+        raw = it.get(key)
+        if raw is None:
+            continue
+        if isinstance(raw, str) and not raw.strip():
+            continue
+        try:
+            q = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if q < 0:
+            continue
+        return q
+    return 1.0
+
+
 def _normalize_store(store):
     """Return store string with spaces removed (e.g. 'STORE 3' -> 'STORE3'), or None if empty."""
     if store is None or (isinstance(store, str) and not store.strip()):
@@ -5538,7 +5559,7 @@ def hold_bill():
                         if not isinstance(it, dict):
                             continue
                         itemcode = str(it.get('id') or it.get('itemcode') or it.get('ITEMCODE') or '').strip()
-                        qty = _to_int(it.get('quantity') or it.get('qty') or it.get('QUANTITY'), 1)
+                        qty = _cart_quantity_from_item(it)
                         rate = _to_float(it.get('price') or it.get('PRICE') or it.get('rate'), 0.0)
                         manufacturer_id = str(it.get('manufactureId') or it.get('MANUFACTURERID') or it.get('manufacturerId') or '').strip()
                         uom_line = str(it.get('uom') or it.get('BASEUOM') or it.get('baseuom') or it.get('UNITOFMEASUREMENT') or '').strip()
@@ -5812,7 +5833,7 @@ def void_line():
             return jsonify({"error": "item (voided line) is required"}), 400
         bill_no = _to_int(bill_no, 1)
         itemcode = str(item.get('id') or item.get('itemcode') or item.get('ITEMCODE') or '').strip()
-        qty = _to_int(item.get('quantity') or item.get('qty') or item.get('QUANTITY'), 1)
+        qty = _cart_quantity_from_item(item)
         rate = _to_float(item.get('price') or item.get('PRICE') or item.get('rate'), 0.0)
         manufacturer_id = str(item.get('manufactureId') or item.get('MANUFACTURERID') or item.get('manufacturerId') or '').strip()
         net_line_amount = qty * rate
@@ -6161,7 +6182,7 @@ def _cart_sync_tempbilldtl(cur, conn, bill_no, location_code, items, item_flag=N
         if not isinstance(it, dict):
             continue
         itemcode = str(it.get('id') or it.get('itemcode') or it.get('ITEMCODE') or '').strip()
-        qty = _to_int(it.get('quantity') or it.get('qty') or it.get('QUANTITY'), 1)
+        qty = _cart_quantity_from_item(it)
         rate = _to_float(it.get('price') or it.get('PRICE') or it.get('rate'), 0.0)
         manufacturer_id = str(it.get('manufactureId') or it.get('MANUFACTURERID') or it.get('manufacturerId') or '').strip()
         uom_line = str(it.get('uom') or it.get('BASEUOM') or it.get('baseuom') or it.get('UNITOFMEASUREMENT') or '').strip()
@@ -6293,7 +6314,7 @@ def display_current_cart():
                 except (ValueError, IndexError):
                     return default
             itemcode = _col('ITEMCODE')
-            qty = _to_int(_col('QUANTITY'), 1)
+            qty = _to_float(_col('QUANTITY'), 1.0)
             rate = _to_float(_col('RATE'), 0.0)
             manufacturer_id = _col('MANUFACTURERID')
             code_str = str(itemcode).strip() if itemcode else ""
@@ -6366,7 +6387,7 @@ def cart_by_bill():
                 except (ValueError, IndexError):
                     return default
             itemcode = _col('ITEMCODE')
-            qty = _to_int(_col('QUANTITY'), 1)
+            qty = _to_float(_col('QUANTITY'), 1.0)
             rate = _to_float(_col('RATE'), 0.0)
             manufacturer_id = _col('MANUFACTURERID')
             code_str = str(itemcode).strip() if itemcode else ""
@@ -6533,7 +6554,7 @@ def list_held_bills():
                             except (ValueError, IndexError):
                                 return default
                         itemcode = _col('ITEMCODE')
-                        qty = _to_int(_col('QUANTITY'), 1)
+                        qty = _to_float(_col('QUANTITY'), 1.0)
                         rate = _to_float(_col('RATE'), 0.0)
                         manufacturer_id = _col('MANUFACTURERID')
                         code_str = str(itemcode).strip() if itemcode else ""
@@ -6623,7 +6644,7 @@ def get_held_bill(bill_no):
                         except (ValueError, IndexError):
                             return default
                     itemcode = col('ITEMCODE')
-                    qty = _to_int(col('QUANTITY'), 1)
+                    qty = _to_float(col('QUANTITY'), 1.0)
                     rate = _to_float(col('RATE'), 0.0)
                     manufacturer_id = col('MANUFACTURERID')
                     code_str = str(itemcode).strip() if itemcode else ""

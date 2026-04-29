@@ -2,6 +2,17 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import '../styles/BackDisplay.css'
 import { getApiBase } from '../apiBase'
 
+/** Piece counts and fractional kg (weighted items) — avoid trimming decimals to integers. */
+function formatBackDisplayQty(n) {
+  const q = Number(n)
+  if (!Number.isFinite(q)) return '0'
+  return new Intl.NumberFormat('en-GB', {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 3,
+    useGrouping: false,
+  }).format(q)
+}
+
 function BackDisplay() {
   const [items, setItems] = useState([])
   const [error, setError] = useState(null)
@@ -84,7 +95,13 @@ function BackDisplay() {
     return () => window.clearTimeout(t)
   }, [showThankYou])
 
-  const total = items.reduce((sum, item) => sum + (Number(item.price) || 0) * (Number(item.quantity) || 0), 0)
+  const total = items.reduce((sum, item) => {
+    const qty = Number(item.quantity ?? item.QUANTITY)
+    const price = Number(item.price ?? item.RATE)
+    const q = Number.isFinite(qty) ? qty : 0
+    const p = Number.isFinite(price) ? price : 0
+    return sum + q * p
+  }, 0)
 
   return (
     <div className="back-display">
@@ -126,15 +143,17 @@ function BackDisplay() {
               </div>
               {items.map((item, index) => {
                 const sl = index + 1
-                const qty = Number(item.quantity) || 0
-                const price = Number(item.price) || 0
+                const qtyRaw = Number(item.quantity ?? item.QUANTITY)
+                const qty = Number.isFinite(qtyRaw) ? qtyRaw : 0
+                const priceRaw = Number(item.price ?? item.RATE)
+                const price = Number.isFinite(priceRaw) ? priceRaw : 0
                 const amount = qty * price
                 const name = (item.name || item.ITEMNAME || '').trim() || `Item ${item.ITEMCODE || item.id || sl}`
                 return (
                   <div key={`${item.ITEMCODE || item.id || 'item'}-${sl}-${index}`} className="back-display-line">
                     <span className="back-display-line-sl">{sl}</span>
                     <span className="back-display-line-name">{name}</span>
-                    <span className="back-display-line-qty">{qty}</span>
+                    <span className="back-display-line-qty">{formatBackDisplayQty(qty)}</span>
                     <span className="back-display-line-price">{price.toFixed(2)}</span>
                     <span className="back-display-line-total">{amount.toFixed(2)}</span>
                   </div>
