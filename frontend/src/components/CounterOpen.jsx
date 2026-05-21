@@ -89,6 +89,7 @@ function CounterOpen({
   counterCode: counterCodeFromParent = '',
   counterName: counterNameFromParent = '',
   onCounterOperationsChanged,
+  onHoldBillOpen,
 }) {
   const [date, setDate] = useState(todayStr())
   const [shiftCode, setShiftCode] = useState('')
@@ -107,6 +108,9 @@ function CounterOpen({
   const [showCloseConfirm, setShowCloseConfirm] = useState(false)
   const [closeConfirmTimeLabel, setCloseConfirmTimeLabel] = useState('')
   const [closing, setClosing] = useState(false)
+  const [heldBills, setHeldBills] = useState([])
+  const [heldBillsLoading, setHeldBillsLoading] = useState(false)
+  const [heldBillOpeningId, setHeldBillOpeningId] = useState(null)
 
   const systemIp = typeof sessionStorage !== 'undefined' ? sessionStorage.getItem('pos_system_ip') || '' : ''
   const counterCodeFromRow = counters[0] ? (counters[0].counterCode ?? counters[0].COUNTERCODE ?? '').toString().trim() : ''
@@ -176,6 +180,50 @@ function CounterOpen({
       .finally(() => setOpenedDatesLoading(false))
   }, [apiBase, counterCode])
 
+  const fetchHeldBills = useCallback(() => {
+    if (!apiBase) return
+    const headers = {}
+    if (token) headers.Authorization = `Bearer ${token}`
+    const loc = encodeURIComponent(locationCode || 'LOC001')
+    setHeldBillsLoading(true)
+    fetch(`${apiBase}/api/hold?locationCode=${loc}`, { headers })
+      .then((res) => res.json())
+      .then((data) => {
+        setHeldBills(Array.isArray(data) ? data : Array.isArray(data.bills) ? data.bills : [])
+      })
+      .catch(() => setHeldBills([]))
+      .finally(() => setHeldBillsLoading(false))
+  }, [apiBase, locationCode, token])
+
+  const openHeldBillInCart = useCallback(
+    async (row) => {
+      const billNoNum = Number(row.BILLNO ?? row.billNo)
+      if (!billNoNum || billNoNum < 1 || !apiBase || typeof onHoldBillOpen !== 'function') return
+      setHeldBillOpeningId(billNoNum)
+      const headers = {}
+      if (token) headers.Authorization = `Bearer ${token}`
+      const loc = encodeURIComponent(locationCode || 'LOC001')
+      try {
+        const res = await fetch(`${apiBase}/api/hold/${billNoNum}?locationCode=${loc}`, { headers })
+        const data = await res.json().catch(() => ({}))
+        if (!res.ok) throw new Error(data.error || 'Could not load held bill')
+        const items = Array.isArray(data.items) ? data.items : []
+        await fetch(`${apiBase}/api/hold/${billNoNum}?locationCode=${loc}`, { method: 'DELETE', headers })
+        onHoldBillOpen(data.billNo ?? billNoNum, items)
+      } catch (e) {
+        const fallbackItems = Array.isArray(row?.items) ? row.items : []
+        if (fallbackItems.length > 0) {
+          onHoldBillOpen(billNoNum, fallbackItems)
+        } else {
+          setActionError(e?.message || String(e))
+        }
+      } finally {
+        setHeldBillOpeningId(null)
+      }
+    },
+    [apiBase, locationCode, token, onHoldBillOpen]
+  )
+
   useEffect(() => {
     fetchCounters()
   }, [fetchCounters])
@@ -183,6 +231,10 @@ function CounterOpen({
   useEffect(() => {
     fetchOpenedDates()
   }, [fetchOpenedDates])
+
+  useEffect(() => {
+    fetchHeldBills()
+  }, [fetchHeldBills])
 
   useEffect(() => {
     fetchStatus()
@@ -580,6 +632,63 @@ function CounterOpen({
               </table>
             </div>
           )}
+        </section>
+
+        <section className="counter-setup-section counter-setup-list">
+          <h3>Held Bills</h3>
+          {heldBillsLoading ? (
+            <p className="counter-setup-muted">Loading…</p>
+          ) : heldBills.length === 0 ? (
+            <p className="counter-setup-muted">No held bills found.</p>
+          ) : (
+            <div className="counter-setup-table-wrap">
+              <table className="counter-setup-table">
+                <thead>
+                  <tr>
+                    <th>Bill No</th>
+                    <th>Held Date</th>
+                    <th>Items</th>
+                    <th>Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {heldBills.map((row, idx) => {
+                    const bn = row.BILLNO ?? row.billNo
+                    const hd = row.HELDDATE ?? row.heldDate ?? ''
+                    const itemCount = Array.isArray(row.items) ? row.items.length : 0
+                    const isOpening = heldBillOpeningId === Number(bn)
+                    return (
+                      <tr key={bn ?? idx}>
+                        <td>{bn ?? '—'}</td>
+                        <td>{hd || '—'}</td>
+                        <td>{itemCount}</td>
+                        <td>
+                          <button
+                            type="button"
+                            className="counter-setup-save-btn"
+                            style={{ padding: '4px 8px', fontSize: 12 }}
+                            onClick={() => openHeldBillInCart(row)}
+                            disabled={isOpening || !onHoldBillOpen}
+                          >
+                            {isOpening ? 'Opening…' : 'Open in Cart'}
+                          </button>
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+          <button
+            type="button"
+            className="counter-setup-save-btn counter-setup-secondary"
+            style={{ marginTop: 8 }}
+            onClick={fetchHeldBills}
+            disabled={heldBillsLoading}
+          >
+            Refresh
+          </button>
         </section>
       </div>
 
