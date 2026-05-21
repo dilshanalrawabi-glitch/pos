@@ -1299,6 +1299,14 @@ function App() {
                   counterCode={counterCode}
                   counterName={counterName}
                   onCounterOperationsChanged={refreshOpenSessionBillDate}
+                  onHoldBillOpen={(retrievedBillNo, items) => {
+                    setCart(items)
+                    const safeBillNo = Number(retrievedBillNo)
+                    const bill = Number.isNaN(safeBillNo) || safeBillNo < 1 ? 1 : safeBillNo
+                    setBillNo(bill)
+                    localStorage.setItem('pos_bill_no', String(bill))
+                    setActiveView('billing')
+                  }}
                 />
               )}
               {activeView === 'settings' && canView('settings') && (
