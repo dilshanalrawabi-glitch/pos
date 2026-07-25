@@ -40,6 +40,7 @@ import bcrypt
 import datetime
 import difflib
 import jwt
+import time
 
 app = Flask(__name__)
 # Enable CORS for all routes with proper configuration
@@ -174,6 +175,28 @@ except oracledb.Error as err:
     print(f"Thick mode init failed: {err}")
     if not _oracle_lib:
         print("Hint: set ORACLE_CLIENT_LIB_DIR in backend/.env to the folder containing oci.dll")
+
+_oracle_pool = None
+
+
+def _init_oracle_pool():
+    global _oracle_pool
+    if _oracle_pool is not None:
+        return _oracle_pool
+    try:
+        _oracle_pool = oracledb.create_pool(
+            user=ORACLE_CONFIG['user'],
+            password=ORACLE_CONFIG['password'],
+            dsn=ORACLE_CONFIG['dsn'],
+            min=1,
+            max=12,
+            increment=1,
+        )
+        print("Oracle connection pool created.")
+    except oracledb.Error as err:
+        print(f"Oracle pool creation failed: {err}")
+        _oracle_pool = None
+    return _oracle_pool
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
@@ -774,14 +797,62 @@ def _next_customercode_plus_one(cur):
     return 1
 
 
+def _qid_digits_only(qid):
+    """Normalize QID to digits only for comparison."""
+    if not qid:
+        return ''
+    return ''.join(ch for ch in str(qid) if ch.isdigit())
+
+
 def _qid_nationality_code_digits(qid):
     """Qatar-style QID: digits 4–6 (1-based) are nationality code (e.g. 12345678901 -> 456)."""
-    if not qid:
-        return None
-    digits = ''.join(ch for ch in str(qid) if ch.isdigit())
+    digits = _qid_digits_only(qid)
     if len(digits) < 6:
         return None
     return digits[3:6]
+
+
+def _customer_lookup_by_qid(cur, qid):
+    """Return (customercode, customername) when QID digits match an existing CUSTOMER row."""
+    digits = _qid_digits_only(qid)
+    if len(digits) != 11:
+        return None
+    for col in ('QID', 'QIDNO', 'NATIONALID'):
+        sql = f"""
+            SELECT TRIM(c.customercode), TRIM(c.customername)
+            FROM customer c
+            WHERE REGEXP_REPLACE(TRIM(NVL(c.{col}, '')), '[^0-9]', '') = :qd
+              AND ROWNUM = 1
+        """
+        try:
+            cur.execute(sql, {'qd': digits})
+            row = cur.fetchone()
+            if row and row[0] is not None:
+                code = str(row[0]).strip()
+                name = str(row[1]).strip() if row[1] is not None else ''
+                return code, name
+        except oracledb.Error as e:
+            err = str(e).upper()
+            if 'ORA-00904' in err or '00904' in err:
+                continue
+            raise
+    return None
+
+
+def _qid_lookup_any(cur, qid):
+    """QID duplicate check against CUSTOMER only."""
+    return _customer_lookup_by_qid(cur, qid)
+
+
+def _qid_duplicate_error_message(existing):
+    """User-facing message when QID is already on file."""
+    if not existing:
+        return 'This Qatar ID is already registered.'
+    code, name = existing
+    parts = [p for p in (code, name) if p]
+    if parts:
+        return f'This Qatar ID is already registered ({", ".join(parts)}).'
+    return 'This Qatar ID is already registered.'
 
 
 def _nationality_name_from_tblnationality(cur, nationality_code):
@@ -832,6 +903,16 @@ def _customers_post_create():
     cur = None
     try:
         cur = conn.cursor()
+        if qid:
+            qid_digits = _qid_digits_only(qid)
+            if len(qid_digits) == 11:
+                existing = _qid_lookup_any(cur, qid)
+                if existing:
+                    return jsonify({
+                        'ok': False,
+                        'error': _qid_duplicate_error_message(existing),
+                        'duplicate': 'qid',
+                    }), 409
         cat = _default_customercategory_code(cur)
         next_num = _next_customercode_plus_one(cur)
         loc_bind = _customer_bind_location_code(loc_raw)
@@ -875,6 +956,8 @@ def _customers_post_create():
             if nat_name
             else (None,)
         )
+        # POS customer add: mark source in ADDRESS when column exists.
+        address_options = (True, False)
 
         last_err = None
         for ccode in code_binds:
@@ -883,88 +966,148 @@ def _customers_post_create():
                     if needs_cat and not cat:
                         continue
                     for nat_col in nat_col_options:
-                        cols = ['LOCATIONCODE', 'CUSTOMERCODE', 'CUSTOMERNAME', 'MOBILE']
-                        vals = [':loc', ':ccode', ':cname', ':mobile']
-                        binds = {'loc': loc_bind, 'ccode': ccode, 'cname': cname, 'mobile': mobile}
-                        if qcol:
-                            cols.append(qcol)
-                            vals.append(':qid')
-                            binds['qid'] = qid
-                        cols.extend(extra_cols)
-                        vals.extend(extra_placeholders)
-                        if ':cat' in extra_placeholders:
-                            binds['cat'] = cat
-                        if nat_col:
-                            cols.append(nat_col)
-                            vals.append(':nation')
-                            binds['nation'] = nat_name
-                        cols.append('CREATEDDATE')
-                        vals.append('SYSDATE')
-                        ins = 'INSERT INTO customer ({}) VALUES ({})'.format(
-                            ', '.join(cols),
-                            ', '.join(vals),
-                        )
-                        try:
-                            cur.execute(ins, binds)
-                            conn.commit()
-                            code_for_fetch = str(ccode).strip()
-                            row = _customer_row_for_pos(cur, code_for_fetch) if code_for_fetch else None
-                            if row:
-                                if qid:
-                                    row['QID'] = qid
-                                    row['qid'] = qid
-                                if nat_name:
-                                    row['NATIONALITY'] = nat_name
-                                    row['nationality'] = nat_name
-                                return jsonify({'ok': True, 'customer': row}), 201
-                            # Row inserted but shape query failed — return minimal payload
-                            minimal = {
-                                'LOCATIONCODE': loc_raw,
-                                'locationcode': loc_raw,
-                                'CUSTOMERCODE': code_for_fetch,
-                                'customercode': code_for_fetch,
-                                'CUSTOMERNAME': cname,
-                                'customername': cname,
-                                'CUST_FULL_NAME': f'{code_for_fetch} {cname}'.strip(),
-                                'cust_full_name': f'{code_for_fetch} {cname}'.strip(),
-                                'MOBILE': mobile or '',
-                                'mobile': mobile or '',
-                                'QID': qid or '',
-                                'qid': qid or '',
-                                'FLAG': 'A',
-                                'flag': 'A',
-                                'INVOICECODE': 1,
-                                'invoicecode': 1,
-                                'POINTS': 0,
-                                'points': 0,
-                            }
-                            if nat_name:
-                                minimal['NATIONALITY'] = nat_name
-                                minimal['nationality'] = nat_name
-                            return jsonify({'ok': True, 'customer': minimal}), 201
-                        except oracledb.Error as e:
+                        for with_address in address_options:
+                            cols = ['LOCATIONCODE', 'CUSTOMERCODE', 'CUSTOMERNAME', 'MOBILE']
+                            vals = [':loc', ':ccode', ':cname', ':mobile']
+                            binds = {'loc': loc_bind, 'ccode': ccode, 'cname': cname, 'mobile': mobile}
+                            if with_address:
+                                cols.append('ADDRESS')
+                                vals.append(':address')
+                                binds['address'] = 'POS'
+                            if qcol:
+                                cols.append(qcol)
+                                vals.append(':qid')
+                                binds['qid'] = qid
+                            cols.extend(extra_cols)
+                            vals.extend(extra_placeholders)
+                            if ':cat' in extra_placeholders:
+                                binds['cat'] = cat
+                            if nat_col:
+                                cols.append(nat_col)
+                                vals.append(':nation')
+                                binds['nation'] = nat_name
+                            cols.append('CREATEDDATE')
+                            vals.append('SYSDATE')
+                            ins = 'INSERT INTO customer ({}) VALUES ({})'.format(
+                                ', '.join(cols),
+                                ', '.join(vals),
+                            )
                             try:
-                                conn.rollback()
-                            except Exception:
-                                pass
-                            err = str(e).upper()
-                            last_err = e
-                            if 'ORA-00904' in err or '00904' in err:
-                                continue
-                            if 'ORA-00932' in err or '00932' in err:
-                                continue
-                            if 'ORA-01400' in err or '01400' in err:
-                                continue
-                            if 'ORA-00001' in err or '00001' in err:
-                                return jsonify({'ok': False, 'error': 'Duplicate or conflicting customer data'}), 409
-                            print(f'[CustomerCreate] insert error: {e}')
-                            return jsonify({'ok': False, 'error': str(e)}), 500
+                                cur.execute(ins, binds)
+                                conn.commit()
+                                code_for_fetch = str(ccode).strip()
+                                row = _customer_row_for_pos(cur, code_for_fetch) if code_for_fetch else None
+                                if row:
+                                    if qid:
+                                        row['QID'] = qid
+                                        row['qid'] = qid
+                                    if nat_name:
+                                        row['NATIONALITY'] = nat_name
+                                        row['nationality'] = nat_name
+                                    if with_address:
+                                        row['ADDRESS'] = 'POS'
+                                        row['address'] = 'POS'
+                                    return jsonify({'ok': True, 'customer': row}), 201
+                                # Row inserted but shape query failed — return minimal payload
+                                minimal = {
+                                    'LOCATIONCODE': loc_raw,
+                                    'locationcode': loc_raw,
+                                    'CUSTOMERCODE': code_for_fetch,
+                                    'customercode': code_for_fetch,
+                                    'CUSTOMERNAME': cname,
+                                    'customername': cname,
+                                    'CUST_FULL_NAME': f'{code_for_fetch} {cname}'.strip(),
+                                    'cust_full_name': f'{code_for_fetch} {cname}'.strip(),
+                                    'MOBILE': mobile or '',
+                                    'mobile': mobile or '',
+                                    'QID': qid or '',
+                                    'qid': qid or '',
+                                    'FLAG': 'A',
+                                    'flag': 'A',
+                                    'INVOICECODE': 1,
+                                    'invoicecode': 1,
+                                    'POINTS': 0,
+                                    'points': 0,
+                                }
+                                if with_address:
+                                    minimal['ADDRESS'] = 'POS'
+                                    minimal['address'] = 'POS'
+                                if nat_name:
+                                    minimal['NATIONALITY'] = nat_name
+                                    minimal['nationality'] = nat_name
+                                return jsonify({'ok': True, 'customer': minimal}), 201
+                            except oracledb.Error as e:
+                                try:
+                                    conn.rollback()
+                                except Exception:
+                                    pass
+                                err = str(e).upper()
+                                last_err = e
+                                if 'ORA-00904' in err or '00904' in err:
+                                    continue
+                                if 'ORA-00932' in err or '00932' in err:
+                                    continue
+                                if 'ORA-01400' in err or '01400' in err:
+                                    continue
+                                if 'ORA-00001' in err or '00001' in err:
+                                    if qid:
+                                        dup = _customer_lookup_by_qid(cur, qid)
+                                        if dup:
+                                            return jsonify({
+                                                'ok': False,
+                                                'error': _qid_duplicate_error_message(dup),
+                                                'duplicate': 'qid',
+                                            }), 409
+                                    return jsonify({'ok': False, 'error': 'Duplicate or conflicting customer data'}), 409
+                                print(f'[CustomerCreate] insert error: {e}')
+                                return jsonify({'ok': False, 'error': str(e)}), 500
 
         if last_err:
             conn.rollback()
             return jsonify({'ok': False, 'error': str(last_err)}), 500
         conn.rollback()
         return jsonify({'ok': False, 'error': 'Could not insert customer (schema mismatch)'}), 500
+    finally:
+        if cur:
+            try:
+                cur.close()
+            except Exception:
+                pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.route('/api/customers/check-qid', methods=['GET', 'OPTIONS'])
+def customers_check_qid():
+    """Return whether an 11-digit QID is already registered (for POS customer add)."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    qid_raw = (request.args.get('qid') or request.args.get('QID') or '').strip()
+    digits = _qid_digits_only(qid_raw)
+    if len(digits) != 11:
+        return jsonify({'ok': True, 'valid': False, 'exists': False})
+    conn = _get_connection()
+    if not conn:
+        return jsonify({'ok': False, 'error': 'Database unavailable'}), 503
+    cur = None
+    try:
+        cur = conn.cursor()
+        existing = _qid_lookup_any(cur, digits)
+        if existing:
+            code, name = existing
+            return jsonify({
+                'ok': True,
+                'valid': True,
+                'exists': True,
+                'customerCode': code,
+                'customercode': code,
+                'customerName': name,
+                'customername': name,
+                'message': _qid_duplicate_error_message(existing),
+            })
+        return jsonify({'ok': True, 'valid': True, 'exists': False})
     finally:
         if cur:
             try:
@@ -992,26 +1135,82 @@ def get_customers():
         )
         cursor = connection.cursor()
         
-        # Execute Query
-        query = """
-            SELECT 
-                c.locationcode, 
-                c.customercode, 
-                c.customercode || ' ' || c.customername AS cust_full_name, 
-                g.categoryname,
+        # All rows from CUSTOMER (not limited to billhdrhistory — new customers must appear in POS search).
+        search_q = (request.args.get('q') or request.args.get('search') or '').strip()
+        search_digits = _qid_digits_only(search_q) if search_q else ''
+        queries = [
+            """
+            SELECT
+                c.locationcode,
+                c.customercode,
+                c.customercode || ' ' || c.customername AS cust_full_name,
+                NVL(TRIM(g.categoryname), '') AS categoryname,
                 c.flag,
                 c.invoicecode,
                 c.currentcreditamount,
                 c.creditlimit,
-                NVL(c.points, 0) AS points,
+                GREATEST(0, NVL(c.points, 0)) AS points,
+                NVL(TRIM(c.mobile), '') AS mobile,
+                NVL(TRIM(c.qid), NVL(TRIM(c.qidno), '')) AS qid
+            FROM customer c
+            LEFT JOIN tblcustomercategory g ON c.customercategory = g.categorycode
+            """,
+            """
+            SELECT
+                c.locationcode,
+                c.customercode,
+                c.customercode || ' ' || c.customername AS cust_full_name,
+                NVL(TRIM(g.categoryname), '') AS categoryname,
+                c.flag,
+                c.invoicecode,
+                c.currentcreditamount,
+                c.creditlimit,
+                GREATEST(0, NVL(c.points, 0)) AS points,
                 NVL(TRIM(c.mobile), '') AS mobile
             FROM customer c
-            INNER JOIN (SELECT DISTINCT customercode FROM billhdrhistory) b 
-                ON c.customercode = b.customercode
-            INNER JOIN tblcustomercategory g 
-                ON c.customercategory = g.categorycode
-        """
-        cursor.execute(query)
+            LEFT JOIN tblcustomercategory g ON c.customercategory = g.categorycode
+            """,
+        ]
+        order_sql = ' ORDER BY c.customername, c.customercode'
+        row_limit = 200 if search_q else None
+        fetch_limit = f' FETCH FIRST {row_limit} ROWS ONLY' if row_limit else ''
+
+        executed = False
+        for idx, base_sql in enumerate(queries):
+            where_clauses = []
+            binds = {}
+            if search_q:
+                where_clauses.append("""
+                    (
+                        UPPER(c.customername) LIKE '%' || UPPER(:search_q) || '%'
+                        OR UPPER(TRIM(c.customercode)) LIKE '%' || UPPER(:search_q) || '%'
+                        OR UPPER(TRIM(c.customercode) || ' ' || c.customername) LIKE '%' || UPPER(:search_q) || '%'
+                    )
+                """)
+                binds['search_q'] = search_q
+                if search_digits:
+                    digit_match = """
+                        REGEXP_REPLACE(TRIM(NVL(c.mobile, '')), '[^0-9]', '') LIKE '%' || :search_digits || '%'
+                    """
+                    if idx == 0:
+                        digit_match += """
+                        OR REGEXP_REPLACE(TRIM(NVL(c.qid, NVL(c.qidno, ''))), '[^0-9]', '') LIKE '%' || :search_digits || '%'
+                        """
+                    where_clauses.append(f'( {digit_match.strip()} )')
+                    binds['search_digits'] = search_digits
+            where_sql = (' WHERE ' + ' OR '.join(f'({w.strip()})' for w in where_clauses)) if where_clauses else ''
+            query = base_sql + where_sql + order_sql + fetch_limit
+            try:
+                cursor.execute(query, binds)
+                executed = True
+                break
+            except oracledb.Error as e:
+                err = str(e).upper()
+                if idx == 0 and ('ORA-00904' in err or '00904' in err):
+                    continue
+                raise
+        if not executed:
+            raise oracledb.Error('Could not list customers')
         
         # Fetch rows and column names
         columns = [col[0] for col in cursor.description]
@@ -1063,13 +1262,13 @@ def get_customers():
 
 @app.route('/api/customers/balance', methods=['GET'])
 def get_customer_balance():
-    """Fetch latest CURRENTCREDITAMOUNT, CREDITLIMIT and points for a customer by customerCode."""
+    """Balance by customer code from CUSTOMER (points, credit)."""
     customer_code = (request.args.get('customerCode') or request.args.get('customer_code') or '').strip()
     if not customer_code:
         return jsonify({"error": "customerCode required", "currentCreditAmount": 0, "creditLimit": 0, "points": 0}), 400
     conn = _get_connection()
     if not conn:
-        return jsonify({"currentCreditAmount": 0, "creditLimit": 0, "points": 0})
+        return jsonify({"currentCreditAmount": 0, "creditLimit": 0, "points": 0, "inCustomerTable": False})
     cur = None
     try:
         cur = conn.cursor()
@@ -1077,7 +1276,7 @@ def get_customer_balance():
             """
             SELECT NVL(c.currentcreditamount, 0) AS currentcreditamount,
                    NVL(c.creditlimit, 0) AS creditlimit,
-                   NVL(c.points, 0) AS points
+                   GREATEST(0, NVL(c.points, 0)) AS points
             FROM customer c
             WHERE TRIM(c.customercode) = TRIM(:custcode)
             AND ROWNUM = 1
@@ -1089,9 +1288,11 @@ def get_customer_balance():
             return jsonify({
                 "currentCreditAmount": _to_float(row[0], 0.0),
                 "creditLimit": _to_float(row[1], 0.0),
-                "points": _to_int(row[2], 0) if len(row) > 2 else 0,
+                "points": _clamp_customer_points(row[2], 0) if len(row) > 2 else 0,
+                "inCustomerTable": True,
+                "source": "customer",
             })
-        return jsonify({"currentCreditAmount": 0, "creditLimit": 0, "points": 0})
+        return jsonify({"currentCreditAmount": 0, "creditLimit": 0, "points": 0, "inCustomerTable": False})
     except oracledb.Error as e:
         err_str = str(e).upper()
         if 'ORA-00904' in err_str or '00904' in err_str:
@@ -1116,6 +1317,80 @@ def get_customer_balance():
                 pass
         print(f"[CustomerBalance] error: {e}")
         return jsonify({"currentCreditAmount": 0, "creditLimit": 0, "points": 0})
+    finally:
+        if cur:
+            try:
+                cur.close()
+            except Exception:
+                pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+_DEFAULT_REDEMPTION_POINT = 10
+_DEFAULT_REDEMPTION_AMOUNT = 1.0
+
+
+def _fetch_redemption_config_from_db(cur):
+    """REDEMPTIONPOINT / REDEMPTIONAMOUNT from TBLPREVILAGEPOINTS (first row)."""
+    for sql in (
+        """
+        SELECT NVL(REDEMPTIONPOINT, 0) AS redemptionpoint,
+               NVL(REDEMPTIONAMOUNT, 0) AS redemptionamount
+        FROM TBLPREVILAGEPOINTS
+        WHERE NVL(REDEMPTIONPOINT, 0) > 0 AND NVL(REDEMPTIONAMOUNT, 0) > 0
+        AND ROWNUM = 1
+        """,
+        """
+        SELECT NVL(REDEMPTIONPOINT, 0) AS redemptionpoint,
+               NVL(REDEMPTIONAMOUNT, 0) AS redemptionamount
+        FROM TBLPREVILAGEPOINTS
+        WHERE ROWNUM = 1
+        """,
+    ):
+        try:
+            cur.execute(sql)
+            row = cur.fetchone()
+            if row:
+                rp = _to_float(row[0], 0)
+                ra = _to_float(row[1], 0)
+                if rp > 0 and ra > 0:
+                    return {"redemptionPoint": rp, "redemptionAmount": ra}
+        except oracledb.Error:
+            pass
+    return {
+        "redemptionPoint": _DEFAULT_REDEMPTION_POINT,
+        "redemptionAmount": _DEFAULT_REDEMPTION_AMOUNT,
+    }
+
+
+@app.route('/api/points/redemption-config', methods=['GET', 'OPTIONS'])
+def get_points_redemption_config():
+    """Fetch point redemption rate from TBLPREVILAGEPOINTS."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    conn = _get_connection()
+    if not conn:
+        return jsonify({
+            "redemptionPoint": _DEFAULT_REDEMPTION_POINT,
+            "redemptionAmount": _DEFAULT_REDEMPTION_AMOUNT,
+            "source": "default",
+        })
+    cur = None
+    try:
+        cur = conn.cursor()
+        cfg = _fetch_redemption_config_from_db(cur)
+        cfg["source"] = "database"
+        return jsonify(cfg)
+    except oracledb.Error as e:
+        print(f"[RedemptionConfig] error: {e}")
+        return jsonify({
+            "redemptionPoint": _DEFAULT_REDEMPTION_POINT,
+            "redemptionAmount": _DEFAULT_REDEMPTION_AMOUNT,
+            "source": "default",
+        })
     finally:
         if cur:
             try:
@@ -1207,6 +1482,64 @@ def get_price_after_category_check(cur, category_code, price_value, from_itemmas
     if _is_category_type_h(cur, category_code):
         return price_value
     return None
+
+
+def _enrich_price_tiers(cur, result, itemcode_from_alt=False, scan_code=None):
+    """Add WHOLESALEPRICE and THIRDPRICE from ITEMMASTER / ITEMALTERNATEUOMMAP."""
+    if not result or not isinstance(result, dict):
+        return
+    ic = str(result.get('ITEMCODE') or result.get('itemcode') or '').strip()
+    if not ic:
+        return
+    im_wholesale = None
+    im_third = None
+    try:
+        cur.execute("""
+            SELECT wholesaleprice, thirdprice FROM itemmaster
+            WHERE UPPER(TRIM(TO_CHAR(itemcode))) = UPPER(:ic) AND ROWNUM = 1
+        """, ic=ic)
+        row = cur.fetchone()
+        if row:
+            im_wholesale = row[0]
+            im_third = row[1] if len(row) > 1 else None
+    except oracledb.Error:
+        pass
+    alt_wholesale = None
+    alt_third = None
+    code_str = str(scan_code or '').strip() if scan_code else ''
+    try:
+        if code_str:
+            cur.execute("""
+                SELECT WHOLESALEPRICE, THIRDPRICE FROM ITEMALTERNATEUOMMAP
+                WHERE (
+                    (MANUFACTURERID IS NOT NULL AND TRIM(TO_CHAR(MANUFACTURERID)) = TRIM(:code))
+                    OR (MANUFACTURERID IS NOT NULL AND UPPER(TRIM(TO_CHAR(MANUFACTURERID))) = UPPER(:code))
+                    OR (ITEMCODE IS NOT NULL AND UPPER(TRIM(TO_CHAR(ITEMCODE))) = UPPER(:ic))
+                ) AND ROWNUM = 1
+            """, code=code_str, ic=ic)
+        else:
+            cur.execute("""
+                SELECT WHOLESALEPRICE, THIRDPRICE FROM ITEMALTERNATEUOMMAP
+                WHERE UPPER(TRIM(TO_CHAR(ITEMCODE))) = UPPER(:ic) AND ROWNUM = 1
+            """, ic=ic)
+        row = cur.fetchone()
+        if row:
+            alt_wholesale = row[0]
+            alt_third = row[1] if len(row) > 1 else None
+    except oracledb.Error:
+        pass
+    if itemcode_from_alt and alt_wholesale is not None:
+        result['WHOLESALEPRICE'] = alt_wholesale
+        result['wholesaleprice'] = alt_wholesale
+    elif im_wholesale is not None:
+        result['WHOLESALEPRICE'] = im_wholesale
+        result['wholesaleprice'] = im_wholesale
+    if itemcode_from_alt and alt_third is not None:
+        result['THIRDPRICE'] = alt_third
+        result['thirdprice'] = alt_third
+    elif im_third is not None:
+        result['THIRDPRICE'] = im_third
+        result['thirdprice'] = im_third
 
 
 def _truncate_2dp(x):
@@ -1378,6 +1711,9 @@ def lookup_product():
     code = (request.args.get('code') or '').strip()
     if not code:
         return jsonify({"error": "code is required"}), 400
+    cached = _lookup_cache_get(code)
+    if cached is not None:
+        return jsonify(cached)
     conn = _get_connection()
     if not conn:
         return jsonify({"found": False, "code": code, "error": "Product not found"}), 200
@@ -1386,6 +1722,20 @@ def lookup_product():
         cursor = conn.cursor()
         row = None
         itemcode_from_alt = None
+        locationcode_from_alt = None
+        alt_retailprice = None
+        alt_alternateuomcode = None
+        alt_conversionfactor = None
+        # 0) ITEMALTERNATEUOMMAP by scanned barcode (MANUFACTURERID) — before ITEMMASTER
+        _ic0, _lc0, _rp0, _uom0, _cf0 = _resolve_itemcode_location_from_alternate(
+            cursor, code, manufacturer_id_only=True
+        )
+        if _ic0:
+            itemcode_from_alt = _ic0
+            locationcode_from_alt = _lc0
+            alt_retailprice = _rp0
+            alt_alternateuomcode = _uom0
+            alt_conversionfactor = _cf0
         # 1) ITEMMASTER: match by manufacturerid (barcode) or itemcode
         try:
             cursor.execute(f"""
@@ -1436,11 +1786,8 @@ def lookup_product():
                             row = cursor.fetchone()
                         except oracledb.Error:
                             pass
-        # 2) ITEMALTERNATEUOMMAP: MANUFACTURERID found here -> use this table's RETAILPRICE, ALTERNATEUOMCODE, CONVERSIONFACTOR; name/category from itemmaster
-        alt_retailprice = None
-        alt_alternateuomcode = None
-        alt_conversionfactor = None
-        if not row:
+        # 2) ITEMALTERNATEUOMMAP (itemcode / legacy paths) when not found in ITEMMASTER
+        if not row and not itemcode_from_alt:
             itemcode_from_alt, locationcode_from_alt, alt_retailprice, alt_alternateuomcode, alt_conversionfactor = _resolve_itemcode_location_from_alternate(cursor, code)
             if itemcode_from_alt:
                 try:
@@ -1475,6 +1822,24 @@ def lookup_product():
                         row = cursor.fetchone()
                     except oracledb.Error:
                         pass
+        elif itemcode_from_alt and not row:
+            try:
+                if locationcode_from_alt:
+                    cursor.execute("""
+                        SELECT locationcode, itemcode, itemname, categorycode, retailprice, manufacturerid AS manufactureid, baseuom
+                        FROM itemmaster
+                        WHERE UPPER(TRIM(TO_CHAR(itemcode))) = UPPER(:ic) AND (UPPER(TRIM(TO_CHAR(locationcode))) = UPPER(:lc) OR TRIM(locationcode) = TRIM(:lc))
+                        AND ROWNUM = 1
+                    """, ic=itemcode_from_alt, lc=locationcode_from_alt)
+                else:
+                    cursor.execute("""
+                        SELECT locationcode, itemcode, itemname, categorycode, retailprice, manufacturerid AS manufactureid, baseuom
+                        FROM itemmaster
+                        WHERE UPPER(TRIM(TO_CHAR(itemcode))) = UPPER(:code) AND ROWNUM = 1
+                    """, code=itemcode_from_alt)
+                row = cursor.fetchone()
+            except oracledb.Error:
+                pass
         if not row:
             veg_result, weight_kg, unit_price = _try_vegetable_meat_barcode(cursor, code)
             if veg_result is not None and unit_price is not None and weight_kg is not None:
@@ -1522,6 +1887,7 @@ def lookup_product():
                     except oracledb.Error:
                         pass
                 result["found"] = True
+                _lookup_cache_set(code, result)
                 return jsonify(result)
             return jsonify({"found": False, "code": code, "error": "Product not found"}), 200
         columns = [col[0] for col in cursor.description]
@@ -1550,10 +1916,11 @@ def lookup_product():
             result['MANUFACTUREID'] = str(code).strip()
             result['MANUFACTURERID'] = str(code).strip()
         # Enrich with COSTPRICE, AVERAGECOST, STORE from itemmaster; ITEMALTERNATEUOMMAP also CONVERSIONFACTOR
+        md_res = {}
         if ic:
             details_map = _get_item_details_from_master(cursor, [ic])
-            details = details_map.get(ic) or {}
-            cp = details.get('costprice')
+            md_res = details_map.get(ic) or {}
+            cp = md_res.get('costprice')
             if cp is not None:
                 try:
                     cp_f = float(cp)
@@ -1580,16 +1947,16 @@ def lookup_product():
                     result['conversionFactor'] = fac
                 except (TypeError, ValueError):
                     pass
-            ac = details.get('averagecost')
+            ac = md_res.get('averagecost')
             if ac is not None:
                 result['AVERAGECOST'] = ac
                 result['averagecost'] = ac
                 result['avgcost'] = ac
-            pa = details.get('prevamount')
+            pa = md_res.get('prevamount')
             if pa is not None:
                 result['PREVAMOUNT'] = pa
                 result['prevamount'] = pa
-            st = details.get('store')
+            st = md_res.get('store')
             if st is not None:
                 result['STORE'] = st
                 result['store'] = st
@@ -1620,7 +1987,40 @@ def lookup_product():
         display_price = get_price_after_category_check(cursor, category_code, price_to_check, from_itemmaster_or_alternate=True)
         result['RETAILPRICE'] = display_price
         result['retailprice'] = display_price
+        ic_res = ic or str(result.get('ITEMCODE') or result.get('itemcode') or '').strip()
+        if ic_res and ic_res != ic:
+            md_res = (_get_item_details_from_master(cursor, [ic_res]).get(ic_res) or {}) or md_res
+        resolved_lookup = _resolve_uom_and_factor_by_barcode(
+            cursor,
+            str(code).strip(),
+            item_code=ic_res,
+            saved_uom=str(result.get('BASEUOM') or result.get('baseuom') or '').strip(),
+            master_details=md_res,
+        )
+        if resolved_lookup.get('uom'):
+            result['BASEUOM'] = resolved_lookup['uom']
+            result['baseuom'] = resolved_lookup['uom']
+        cf_res = resolved_lookup.get('conversionFactor')
+        if cf_res is not None:
+            result['CONVERSIONFACTOR'] = cf_res
+            result['conversionFactor'] = cf_res
+            if resolved_lookup.get('fromAlternate') and md_res.get('costprice') is not None:
+                try:
+                    result['COSTPRICE'] = float(cf_res) * float(md_res['costprice'])
+                    result['costprice'] = result['COSTPRICE']
+                except (TypeError, ValueError):
+                    pass
+        if resolved_lookup.get('fromAlternate') and code:
+            result['manufactureid'] = str(code).strip()
+            result['MANUFACTUREID'] = str(code).strip()
+            result['MANUFACTURERID'] = str(code).strip()
+        _enrich_price_tiers(
+            cursor, result,
+            itemcode_from_alt=bool(itemcode_from_alt or resolved_lookup.get('fromAlternate')),
+            scan_code=code,
+        )
         result["found"] = True
+        _lookup_cache_set(code, result)
         return jsonify(result)
     except oracledb.Error as e:
         print(f"Oracle lookup error: {e}")
@@ -1640,6 +2040,9 @@ def lookup_product():
 @app.route('/api/products', methods=['GET'])
 def get_products():
     """Fetch products from ITEMMASTER and ITEMALTERNATEUOMMAP; show if either table has the product."""
+    cached = _products_cache_get()
+    if cached is not None:
+        return jsonify(cached)
     conn = _get_connection()
     if not conn:
         return jsonify(_get_products_mock_data()), 200
@@ -1654,6 +2057,8 @@ def get_products():
                 p.itemname,
                 p.categorycode,
                 p.retailprice,
+                p.wholesaleprice,
+                p.thirdprice,
                 p.costprice,
                 p.averagecost,
                 p.store,
@@ -1737,53 +2142,69 @@ def get_products():
         alt_table = qualified_alt if qualified_alt else "ITEMALTERNATEUOMMAP"
         try:
             cursor.execute(f"""
-                SELECT {itemcode_col_alt} AS itemcode, LOCATIONCODE AS locationcode, MANUFACTURERID AS manufacturerid, RETAILPRICE AS retailprice, ALTERNATEUOMCODE AS alternateuomcode, CONVERSIONFACTOR AS conversionfactor
+                SELECT {itemcode_col_alt} AS itemcode, LOCATIONCODE AS locationcode, MANUFACTURERID AS manufacturerid, RETAILPRICE AS retailprice, WHOLESALEPRICE AS wholesaleprice, THIRDPRICE AS thirdprice, ALTERNATEUOMCODE AS alternateuomcode, CONVERSIONFACTOR AS conversionfactor
                 FROM {alt_table}
                 WHERE {itemcode_col_alt} IS NOT NULL
             """)
             alt_rows = cursor.fetchall()
         except oracledb.Error:
             try:
-                cursor.execute("""
-                    SELECT ITEMCODE AS itemcode, LOCATIONCODE AS locationcode, MANUFACTURERID AS manufacturerid, RETAILPRICE AS retailprice, ALTERNATEUOMCODE AS alternateuomcode, CONVERSIONFACTOR AS conversionfactor
-                    FROM ITEMALTERNATEUOMMAP
-                    WHERE ITEMCODE IS NOT NULL
+                cursor.execute(f"""
+                    SELECT {itemcode_col_alt} AS itemcode, LOCATIONCODE AS locationcode, MANUFACTURERID AS manufacturerid, RETAILPRICE AS retailprice, ALTERNATEUOMCODE AS alternateuomcode, CONVERSIONFACTOR AS conversionfactor
+                    FROM {alt_table}
+                    WHERE {itemcode_col_alt} IS NOT NULL
                 """)
                 alt_rows = cursor.fetchall()
             except oracledb.Error:
                 try:
                     cursor.execute("""
-                        SELECT ITEMCODE AS itemcode, LOCATIONCODE AS locationcode, MANUFACTURERID AS manufacturerid, RETAILPRICE AS retailprice, ALTERNATEUOMCODE AS alternateuomcode
+                        SELECT ITEMCODE AS itemcode, LOCATIONCODE AS locationcode, MANUFACTURERID AS manufacturerid, RETAILPRICE AS retailprice, WHOLESALEPRICE AS wholesaleprice, THIRDPRICE AS thirdprice, ALTERNATEUOMCODE AS alternateuomcode, CONVERSIONFACTOR AS conversionfactor
                         FROM ITEMALTERNATEUOMMAP
                         WHERE ITEMCODE IS NOT NULL
                     """)
-                    alt_rows = [(r[0], r[1] if len(r) > 1 else None, r[2] if len(r) > 2 else r[1] if len(r) == 2 else None, r[3] if len(r) > 3 else None, r[4] if len(r) > 4 else None, None) for r in cursor.fetchall()]
+                    alt_rows = cursor.fetchall()
                 except oracledb.Error:
                     try:
                         cursor.execute("""
-                            SELECT ITEMCODE AS itemcode, LOCATIONCODE AS locationcode, MANUFACTURERID AS manufacturerid, RETAILPRICE AS retailprice
+                            SELECT ITEMCODE AS itemcode, LOCATIONCODE AS locationcode, MANUFACTURERID AS manufacturerid, RETAILPRICE AS retailprice, ALTERNATEUOMCODE AS alternateuomcode, CONVERSIONFACTOR AS conversionfactor
                             FROM ITEMALTERNATEUOMMAP
                             WHERE ITEMCODE IS NOT NULL
                         """)
-                        alt_rows = [(r[0], r[1] if len(r) > 1 else None, r[2] if len(r) > 2 else r[1] if len(r) == 2 else None, r[3] if len(r) > 3 else None, None, None) for r in cursor.fetchall()]
+                        alt_rows = cursor.fetchall()
                     except oracledb.Error:
                         try:
                             cursor.execute("""
-                                SELECT ITEMCODE AS itemcode, LOCATIONCODE AS locationcode, MANUFACTURERID AS manufacturerid
+                                SELECT ITEMCODE AS itemcode, LOCATIONCODE AS locationcode, MANUFACTURERID AS manufacturerid, RETAILPRICE AS retailprice, ALTERNATEUOMCODE AS alternateuomcode
                                 FROM ITEMALTERNATEUOMMAP
                                 WHERE ITEMCODE IS NOT NULL
                             """)
-                            alt_rows = [(r[0], r[1] if len(r) > 1 else None, r[2] if len(r) > 2 else r[1] if len(r) == 2 else None, None, None, None) for r in cursor.fetchall()]
+                            alt_rows = [(r[0], r[1] if len(r) > 1 else None, r[2] if len(r) > 2 else r[1] if len(r) == 2 else None, r[3] if len(r) > 3 else None, r[4] if len(r) > 4 else None, None, None, None) for r in cursor.fetchall()]
                         except oracledb.Error:
                             try:
                                 cursor.execute("""
-                                    SELECT ITEMCODE AS itemcode, MANUFACTURERID AS manufacturerid
+                                    SELECT ITEMCODE AS itemcode, LOCATIONCODE AS locationcode, MANUFACTURERID AS manufacturerid, RETAILPRICE AS retailprice
                                     FROM ITEMALTERNATEUOMMAP
                                     WHERE ITEMCODE IS NOT NULL
                                 """)
-                                alt_rows = [(r[0], None, r[1], None, None, None) for r in cursor.fetchall()] if cursor.description and len(cursor.description) >= 2 else []
+                                alt_rows = [(r[0], r[1] if len(r) > 1 else None, r[2] if len(r) > 2 else r[1] if len(r) == 2 else None, r[3] if len(r) > 3 else None, None, None, None, None) for r in cursor.fetchall()]
                             except oracledb.Error:
-                                alt_rows = []
+                                try:
+                                    cursor.execute("""
+                                        SELECT ITEMCODE AS itemcode, LOCATIONCODE AS locationcode, MANUFACTURERID AS manufacturerid
+                                        FROM ITEMALTERNATEUOMMAP
+                                        WHERE ITEMCODE IS NOT NULL
+                                    """)
+                                    alt_rows = [(r[0], r[1] if len(r) > 1 else None, r[2] if len(r) > 2 else r[1] if len(r) == 2 else None, None, None, None, None, None) for r in cursor.fetchall()]
+                                except oracledb.Error:
+                                    try:
+                                        cursor.execute("""
+                                            SELECT ITEMCODE AS itemcode, MANUFACTURERID AS manufacturerid
+                                            FROM ITEMALTERNATEUOMMAP
+                                            WHERE ITEMCODE IS NOT NULL
+                                        """)
+                                        alt_rows = [(r[0], None, r[1], None, None, None, None, None) for r in cursor.fetchall()] if cursor.description and len(cursor.description) >= 2 else []
+                                    except oracledb.Error:
+                                        alt_rows = []
         if alt_rows:
             alt_itemcodes = list({str(r[0]).strip() for r in alt_rows if r and r[0]})
             itemmaster_by_ic_lc = {}
@@ -1834,8 +2255,20 @@ def get_products():
                 lc_alt = row[1] if len(row) > 1 else None
                 alt_manufacturerid = row[2] if len(row) > 2 else (row[1] if len(row) == 2 else None)
                 alt_retailprice = row[3] if len(row) > 3 else None
-                alt_alternateuomcode = row[4] if len(row) > 4 else None
-                alt_conversionfactor = row[5] if len(row) > 5 else None
+                alt_wholesaleprice = None
+                alt_thirdprice = None
+                alt_alternateuomcode = None
+                alt_conversionfactor = None
+                if len(row) >= 8:
+                    alt_wholesaleprice = row[4]
+                    alt_thirdprice = row[5]
+                    alt_alternateuomcode = row[6]
+                    alt_conversionfactor = row[7]
+                elif len(row) >= 6:
+                    alt_alternateuomcode = row[4]
+                    alt_conversionfactor = row[5]
+                elif len(row) >= 5:
+                    alt_alternateuomcode = row[4]
                 if alt_alternateuomcode is not None:
                     alt_alternateuomcode = str(alt_alternateuomcode).strip() or None
                 if ic and alt_alternateuomcode:
@@ -1866,6 +2299,8 @@ def get_products():
                     'ITEMNAME': im_rec.get('ITEMNAME') or im_rec.get('itemname'),
                     'CATEGORYCODE': im_rec.get('CATEGORYCODE') or im_rec.get('categorycode'),
                     'RETAILPRICE': alt_retailprice if alt_retailprice is not None else (im_rec.get('RETAILPRICE') or im_rec.get('retailprice')),
+                    'WHOLESALEPRICE': alt_wholesaleprice if alt_wholesaleprice is not None else (im_rec.get('WHOLESALEPRICE') or im_rec.get('wholesaleprice')),
+                    'THIRDPRICE': alt_thirdprice if alt_thirdprice is not None else (im_rec.get('THIRDPRICE') or im_rec.get('thirdprice')),
                     'MANUFACTURERID': alt_manufacturerid or im_rec.get('MANUFACTURERID') or im_rec.get('manufacturerid'),
                     'MANUFACTUREID': alt_manufacturerid or im_rec.get('MANUFACTURERID') or im_rec.get('manufacturerid') or im_rec.get('MANUFACTUREID') or im_rec.get('manufactureid'),
                     'manufactureid': alt_manufacturerid or im_rec.get('MANUFACTURERID') or im_rec.get('manufacturerid') or im_rec.get('MANUFACTUREID') or im_rec.get('manufactureid'),
@@ -1982,6 +2417,7 @@ def get_products():
         for rec in results:
             itemcode = str(rec.get('ITEMCODE') or rec.get('itemcode') or '').strip()
             rec['ALTERNATECODES'] = alt_map.get(itemcode, [])
+        _products_cache_set(results)
         return jsonify(results)
     except oracledb.Error as e:
         print(f"Oracle get_products error: {e}")
@@ -2131,20 +2567,161 @@ BILLHDRHISTORY_TABLE_NAME = 'BILLHDRHISTORY'
 ITEMJOURNAL_TABLE_NAME = 'ITEMJOURNAL'
 ITEMLOG_TABLE_NAME = 'ITEMLOG'
 # BILLNOTABLE columns: BILLNO NUMBER, FLAG CHAR(1) DEFAULT 'n' (n/y), BILLDATE (required), COUNTERCODE (optional).
-# BILLDTL (paid bill detail): LOCATIONCODE, BILLNO, SLNO, ITEMCODE, QUANTITY, RATE, ITDISC=0, STORE1..5=0, COST=costprice, AVERAGECOST=itemmaster.averagecost (or line), BASEQTY=COSTPRICE*1 (ITEMMASTER) or COSTPRICE*CONVERSIONFACTOR (ITEMALTERNATEUOMMAP), UNITOFMEASUREMENT=ITEMMASTER.baseuom. Insert on Pay.
-# BILLDTLHISTORY: same columns and rows as BILLDTL on Pay (parallel insert).
-# BILLHDR (bill header on Pay): LOCATIONCODE, BILLNO, BILLDATE, BILLTYPE (C=cash sale, R=credit sale from INVOICECODE only), COUNTERCODE, RESETNO=1, SESSIONCODE=0.
-# BILLHDRHISTORY: same header row as BILLHDR on Pay (parallel insert/update).
+# Pay: INSERT only into BILLHDR/BILLDTL (+ HISTORY); scoped by BILLNO + LOCATIONCODE + COUNTERCODE.
+# Never DELETE paid rows on Pay. Same session already paid → 409. Other counter/location → 409.
 # HOLD table (TEMPBILLHDR): BILLNO, LOCATIONCODE, FLAG. At HOLD time FLAG=0 (held); draft FLAG=1.
 # HOLD detail (TEMPBILLDTL): BILLNO, SLNO, ITEMCODE, QUANTITY, RATE, MANUFACTURERID, ITEMFLAG.
 # ITEMJOURNAL: journal of item lines at payment; never deleted. RECEIPTNO=BILLNO, LINENO=SLNO, SOURCE_NO=billNo, TRANSTYPE=SALES, SOURCE_DOC=BILL.
-# ITEMLOG: snapshot per bill at payment (delete rows for DOCUMENTNO+LOCATIONCODE, then insert); SALE qty negative, SALE RETURN positive; FACTOR = integer (conversion × line QTY, rounded); QUANTITY keeps decimals; CREATEDDATE on insert (SYSDATE).
+# ITEMLOG: snapshot per bill at payment (insert only; no delete on Pay). SALE qty negative, SALE RETURN positive; FACTOR = conversion × line QTY (3 dp); CREATEDDATE on insert (SYSDATE).
 FLAG_HELD = 0   # TEMPBILLHDR/TEMPBILLDTL: when bill is held
 FLAG_DRAFT = 1  # TEMPBILLHDR: when bill is draft/current cart
 _held_bills_fallback = {}  # key: (location_code, bill_no) -> { "counterCode", "heldDate", "customerCode", "items": [...] }
 
+_lookup_cache = {}
+_LOOKUP_CACHE_TTL_SEC = 300
+_LOOKUP_CACHE_MAX = 5000
+
+_products_cache = {}
+_PRODUCTS_CACHE_TTL_SEC = 300
+
+
+def _lookup_cache_key(code):
+    return (code or '').strip().upper()
+
+
+def _lookup_cache_get(code):
+    key = _lookup_cache_key(code)
+    if not key:
+        return None
+    entry = _lookup_cache.get(key)
+    if not entry:
+        return None
+    ts, data = entry
+    if time.time() - ts > _LOOKUP_CACHE_TTL_SEC:
+        _lookup_cache.pop(key, None)
+        return None
+    return dict(data)
+
+
+def _lookup_cache_set(code, data):
+    key = _lookup_cache_key(code)
+    if not key or not data:
+        return
+    if len(_lookup_cache) >= _LOOKUP_CACHE_MAX:
+        oldest_key = min(_lookup_cache, key=lambda k: _lookup_cache[k][0])
+        _lookup_cache.pop(oldest_key, None)
+    _lookup_cache[key] = (time.time(), dict(data))
+
+
+def _products_cache_get():
+    entry = _products_cache.get('all')
+    if not entry:
+        return None
+    ts, data = entry
+    if time.time() - ts > _PRODUCTS_CACHE_TTL_SEC:
+        _products_cache.pop('all', None)
+        return None
+    return list(data)
+
+
+def _products_cache_set(data):
+    if not data:
+        return
+    _products_cache['all'] = (time.time(), list(data))
+
+
+def _cart_dtl_line_key(itemcode, manufacturer_id):
+    ic = str(itemcode or '').strip().upper()
+    mid = str(manufacturer_id or '').strip().upper()
+    return ic, mid
+
+
+def _item_to_dtl_param(it, bill_no, location_code, slno, item_flag=None):
+    """Build one TEMPBILLDTL bind dict from a cart item."""
+    itemcode = str(it.get('id') or it.get('itemcode') or it.get('ITEMCODE') or '').strip()
+    qty = _cart_quantity_from_item(it)
+    rate = _to_float(it.get('price') or it.get('PRICE') or it.get('rate'), 0.0)
+    manufacturer_id = str(it.get('manufactureId') or it.get('MANUFACTURERID') or it.get('manufacturerId') or '').strip()
+    uom_line = str(it.get('uom') or it.get('BASEUOM') or it.get('baseuom') or it.get('UNITOFMEASUREMENT') or '').strip()
+    prevpoints = _to_float(it.get('prevpoints') or it.get('PREVPOINTS') or it.get('points') or 0, 0)
+    costprice = _to_float(it.get('costprice') or it.get('COSTPRICE') or it.get('cost') or 0, 0)
+    retailprice = _to_float(it.get('retailprice') or it.get('RETAILPRICE') or it.get('retail') or rate, 0)
+    store = str(it.get('store') or it.get('STORE') or location_code or '').strip()
+    return {
+        'loc': location_code,
+        'billno': bill_no,
+        'slno': slno,
+        'itemcode': itemcode or None,
+        'quantity': qty,
+        'rate': rate,
+        'manufacturerid': manufacturer_id or None,
+        'uom': uom_line or None,
+        'void': bool(it.get('void')),
+        'unitofmeasurement': uom_line or None,
+        'resetno': 1,
+        'prevpoints': prevpoints,
+        'costprice': costprice,
+        'retailprice': retailprice,
+        'store': store or location_code,
+        'itemflag': item_flag if item_flag is not None else (1 if itemcode else 0),
+    }
+
+
+def _executemany_tempbilldtl(cur, dtl_params):
+    if not dtl_params:
+        return
+    dtl_bind = [
+        {
+            'loc': p['loc'],
+            'billno': p['billno'],
+            'slno': p['slno'],
+            'itemcode': p['itemcode'],
+            'quantity': p['quantity'],
+            'rate': p['rate'],
+            'manufacturerid': p['manufacturerid'],
+            'unitofmeasurement': p['unitofmeasurement'],
+            'resetno': p['resetno'],
+            'prevpoints': p['prevpoints'],
+            'costprice': p['costprice'],
+            'retailprice': p['retailprice'],
+            'store': p['store'],
+            'itemflag': p['itemflag'],
+        }
+        for p in dtl_params
+    ]
+    try:
+        cur.executemany(f"""
+            INSERT INTO {HOLD_DTL_TABLE_NAME} (LOCATIONCODE, BILLNO, SLNO, ITEMCODE, QUANTITY, RATE, MANUFACTURERID, UNITOFMEASUREMENT, RESETNO, PREVPOINTS, COSTPRICE, RETAILPRICE, STORE, ITEMFLAG)
+            VALUES (:loc, :billno, :slno, :itemcode, :quantity, :rate, :manufacturerid, :unitofmeasurement, :resetno, :prevpoints, :costprice, :retailprice, :store, :itemflag)
+        """, dtl_bind)
+    except oracledb.Error as e:
+        if 'ORA-00904' not in str(e).upper() and '00904' not in str(e).upper():
+            raise
+        dtl_bind_fallback = [
+            {
+                'loc': p['loc'],
+                'billno': p['billno'],
+                'slno': p['slno'],
+                'itemcode': p['itemcode'],
+                'quantity': p['quantity'],
+                'rate': p['rate'],
+                'manufacturerid': p['manufacturerid'],
+            }
+            for p in dtl_params
+        ]
+        cur.executemany(f"""
+            INSERT INTO {HOLD_DTL_TABLE_NAME} (LOCATIONCODE, BILLNO, SLNO, ITEMCODE, QUANTITY, RATE, MANUFACTURERID)
+            VALUES (:loc, :billno, :slno, :itemcode, :quantity, :rate, :manufacturerid)
+        """, dtl_bind_fallback)
+
 
 def _get_connection():
+    pool = _init_oracle_pool()
+    if pool is not None:
+        try:
+            return pool.acquire()
+        except oracledb.Error as e:
+            print(f"[Oracle] pool acquire failed: {e}")
     try:
         return oracledb.connect(
             user=ORACLE_CONFIG['user'],
@@ -2207,7 +2784,8 @@ def _ensure_tempbillhdr(cur):
             BILLTIME VARCHAR2(10),
             COUNTERCODE VARCHAR2(50),
             RESETNO NUMBER DEFAULT 1,
-            PREVPOINTS NUMBER DEFAULT 0
+            PREVPOINTS NUMBER DEFAULT 0,
+            CREATEDBY VARCHAR2(100)
         )
     """
     try:
@@ -2221,6 +2799,14 @@ def _ensure_tempbillhdr(cur):
         else:
             print(f"[Hold] {HOLD_TABLE_NAME} create failed: {e}")
             raise
+
+    # Try adding CREATEDBY to existing table
+    try:
+        cur.execute(f"ALTER TABLE {HOLD_TABLE_NAME} ADD (CREATEDBY VARCHAR2(100))")
+    except oracledb.Error as e:
+        err_str = str(e).upper()
+        if 'ORA-01430' in err_str or '01430' in err_str or 'ORA-00955' in err_str or '00955' in err_str or 'ORA-01031' in err_str or '01031' in err_str:
+            pass
 
 
 def _ensure_tempbilldtl(cur):
@@ -2300,7 +2886,8 @@ def _ensure_itemlog(cur):
             LOCATIONCODE VARCHAR2(50),
             RATE NUMBER DEFAULT 0,
             FACTOR NUMBER DEFAULT 0,
-            CREATEDDATE DATE DEFAULT SYSDATE
+            CREATEDDATE DATE DEFAULT SYSDATE,
+            CREATEDBY VARCHAR2(100)
         )
     """
     try:
@@ -2344,6 +2931,21 @@ def _ensure_itemlog(cur):
             pass
         else:
             pass
+    try:
+        cur.execute(f"ALTER TABLE {ITEMLOG_TABLE_NAME} ADD (CREATEDBY VARCHAR2(100))")
+    except oracledb.Error as e:
+        err_str = str(e).upper()
+        if (
+            'ORA-01430' in err_str
+            or '01430' in err_str
+            or 'ORA-00955' in err_str
+            or '00955' in err_str
+            or 'ORA-01031' in err_str
+            or '01031' in err_str
+        ):
+            pass
+        else:
+            pass
 
 
 def _to_int(val, default=0):
@@ -2354,6 +2956,11 @@ def _to_int(val, default=0):
         return int(float(val))
     except (TypeError, ValueError):
         return default
+
+
+def _clamp_customer_points(val, default=0):
+    """CUSTOMER.POINTS must not be negative (floor at 0)."""
+    return max(0, _to_int(val, default))
 
 
 def _to_float(val, default=0.0):
@@ -2602,11 +3209,12 @@ def _finalize_alternate_uom_for_map_row(cur, itemcode, locationcode, alt_uom):
     return new_s
 
 
-def _resolve_itemcode_location_from_alternate(cur, code):
+def _resolve_itemcode_location_from_alternate(cur, code, manufacturer_id_only=False):
     """
     Resolve barcode/code to (ITEMCODE, LOCATIONCODE, RETAILPRICE, ALTERNATEUOMCODE, CONVERSIONFACTOR) from ITEMALTERNATEUOMMAP.
     Returns (itemcode_str, locationcode_or_none, retailprice_or_none, alternateuomcode_or_none, conversionfactor_or_none).
     When UNITOFMEASUREMENT exists, ALTERNATEUOMCODE is validated against it; wrong spellings are corrected and persisted.
+    manufacturer_id_only: match MANUFACTURERID (scanned barcode) only — used for cart restore / hold / lookup by barcode.
     """
     if not code or not str(code).strip():
         return None, None, None, None, None
@@ -2629,6 +3237,69 @@ def _resolve_itemcode_location_from_alternate(cur, code):
         if ic_s and au:
             au = _finalize_alternate_uom_for_map_row(cur, ic_s, loc_n, au)
         return ic_s, loc_n, price, au, conv_factor
+
+    def _parse_alt_row(row):
+        if not row or not row[0]:
+            return None, None, None, None, None
+        price = row[2] if len(row) > 2 and row[2] is not None else None
+        alt_uom = row[3] if len(row) > 3 and row[3] is not None else None
+        conv_factor = row[4] if len(row) > 4 and row[4] is not None else None
+        if alt_uom is not None:
+            alt_uom = str(alt_uom).strip() or None
+        return _out(row[0], row[1] if len(row) > 1 else None, price, alt_uom, conv_factor)
+
+    if manufacturer_id_only:
+        manuf_where = f"""(
+            (MANUFACTURERID IS NOT NULL AND TRIM(MANUFACTURERID) = TRIM(:code))
+            OR (MANUFACTURERID IS NOT NULL AND TRIM(TO_CHAR(MANUFACTURERID, '{_ORACLE_NUM_FMT}')) = TRIM(:code))
+            OR (MANUFACTURERID IS NOT NULL AND UPPER(TRIM(TO_CHAR(MANUFACTURERID))) = UPPER(:code))
+        )"""
+        for sql in (
+            f"""
+                SELECT ITEMCODE, LOCATIONCODE, RETAILPRICE, ALTERNATEUOMCODE, CONVERSIONFACTOR FROM ITEMALTERNATEUOMMAP
+                WHERE {manuf_where} AND ROWNUM = 1
+            """,
+            f"""
+                SELECT ITEMCODE, LOCATIONCODE, RETAILPRICE, ALTERNATEUOMCODE FROM ITEMALTERNATEUOMMAP
+                WHERE {manuf_where} AND ROWNUM = 1
+            """,
+        ):
+            try:
+                cur.execute(sql, code=code_str)
+                parsed = _parse_alt_row(cur.fetchone())
+                if parsed[0]:
+                    return parsed
+            except oracledb.Error:
+                pass
+        qualified, itemcode_col, alternate_cols = _get_alternate_uom_table_info(cur)
+        if qualified and itemcode_col:
+            for col in (alternate_cols or []):
+                if col and str(col).upper() == 'MANUFACTURERID':
+                    try:
+                        cur.execute(f"""
+                            SELECT {itemcode_col}, LOCATIONCODE, RETAILPRICE, ALTERNATEUOMCODE, CONVERSIONFACTOR FROM {qualified}
+                            WHERE {col} IS NOT NULL AND TRIM(TO_CHAR(NVL({col}, 0), '{_ORACLE_NUM_FMT}')) = TRIM(:code)
+                            AND ROWNUM = 1
+                        """, code=code_str)
+                        parsed = _parse_alt_row(cur.fetchone())
+                        if parsed[0]:
+                            return parsed
+                    except oracledb.Error:
+                        try:
+                            cur.execute(f"""
+                                SELECT {itemcode_col}, LOCATIONCODE, RETAILPRICE, ALTERNATEUOMCODE FROM {qualified}
+                                WHERE TRIM({col}) = TRIM(:code) AND ROWNUM = 1
+                            """, code=code_str)
+                            row = cur.fetchone()
+                            if row and row[0]:
+                                price = row[2] if len(row) > 2 and row[2] is not None else None
+                                alt_uom = row[3] if len(row) > 3 and row[3] is not None else None
+                                if alt_uom is not None:
+                                    alt_uom = str(alt_uom).strip() or None
+                                return _out(row[0], row[1] if len(row) > 1 else None, price, alt_uom, None)
+                        except oracledb.Error:
+                            pass
+        return None, None, None, None, None
 
     # 1) ITEMALTERNATEUOMMAP: get ITEMCODE, LOCATIONCODE, RETAILPRICE, ALTERNATEUOMCODE, CONVERSIONFACTOR
     try:
@@ -2772,10 +3443,375 @@ def _resolve_itemcode_from_alternate(cur, code):
     return ic
 
 
+def _dtl_col(row, cols, name, default=None):
+    try:
+        i = cols.index(name)
+        return row[i] if i >= 0 and i < len(row) else default
+    except (ValueError, IndexError):
+        return default
+
+
+def _fetch_tempbilldtl_rows(cur, bill_no):
+    """Load TEMPBILLDTL lines; includes UNITOFMEASUREMENT when the column exists."""
+    _ensure_tempbilldtl(cur)
+    queries = (
+        f"SELECT SLNO, ITEMCODE, QUANTITY, RATE, MANUFACTURERID, UNITOFMEASUREMENT FROM {HOLD_DTL_TABLE_NAME} WHERE BILLNO = :billno ORDER BY SLNO",
+        f"SELECT SLNO, ITEMCODE, QUANTITY, RATE, MANUFACTURERID FROM {HOLD_DTL_TABLE_NAME} WHERE BILLNO = :billno ORDER BY SLNO",
+    )
+    for sql in queries:
+        try:
+            cur.execute(sql, billno=bill_no)
+            rows = cur.fetchall()
+            cols = [c[0].upper() if c else '' for c in cur.description] if cur.description else []
+            return rows, cols
+        except oracledb.Error as e:
+            err = str(e).upper()
+            if 'ORA-00904' not in err and '00904' not in err:
+                raise
+    return [], []
+
+
+def _tempbilldtl_row_to_cart_item(row, cols):
+    itemcode = _dtl_col(row, cols, 'ITEMCODE')
+    qty = _to_float(_dtl_col(row, cols, 'QUANTITY'), 1.0)
+    rate = _to_float(_dtl_col(row, cols, 'RATE'), 0.0)
+    manufacturer_id = _dtl_col(row, cols, 'MANUFACTURERID')
+    code_str = str(itemcode).strip() if itemcode else ""
+    manuf_str = str(manufacturer_id).strip() if manufacturer_id else ""
+    item = {
+        "id": code_str or 0,
+        "name": "",
+        "price": rate,
+        "quantity": qty,
+        "manufactureId": manuf_str,
+        "ITEMCODE": code_str,
+        "MANUFACTURERID": manuf_str,
+    }
+    uom_saved = _dtl_col(row, cols, 'UNITOFMEASUREMENT')
+    if uom_saved is not None and str(uom_saved).strip():
+        item["uom"] = str(uom_saved).strip()
+    return item
+
+
+def _lookup_conversion_factor_for_line(cur, barcode=None, item_code=None, alternate_uom=None):
+    """Fetch CONVERSIONFACTOR from ITEMALTERNATEUOMMAP by barcode or itemcode+UOM."""
+    barcode = str(barcode or '').strip()
+    item_code = str(item_code or '').strip()
+    alternate_uom = str(alternate_uom or '').strip()
+    if barcode:
+        _ic, _loc, _rp, _uom, cf = _resolve_itemcode_location_from_alternate(
+            cur, barcode, manufacturer_id_only=True
+        )
+        if cf is not None:
+            try:
+                return float(cf)
+            except (TypeError, ValueError):
+                pass
+    if item_code and alternate_uom:
+        try:
+            cur.execute("""
+                SELECT CONVERSIONFACTOR FROM ITEMALTERNATEUOMMAP
+                WHERE UPPER(TRIM(TO_CHAR(ITEMCODE))) = UPPER(TRIM(:ic))
+                  AND UPPER(TRIM(ALTERNATEUOMCODE)) = UPPER(TRIM(:uom))
+                  AND ROWNUM = 1
+            """, ic=item_code, uom=alternate_uom)
+            row = cur.fetchone()
+            if row and row[0] is not None:
+                return float(row[0])
+        except oracledb.Error:
+            pass
+    return None
+
+
+def _patch_tempbilldtl_from_cart_items(cur, bill_no, items):
+    """Update MANUFACTURERID and UNITOFMEASUREMENT on held lines (fast hold — keeps barcodes for factor restore)."""
+    bill_no = _to_int(bill_no, 1)
+    slno = 1
+    for it in items or []:
+        if not isinstance(it, dict) or it.get('void'):
+            continue
+        itemcode = str(it.get('id') or it.get('itemcode') or it.get('ITEMCODE') or '').strip()
+        manuf = str(it.get('manufactureId') or it.get('MANUFACTURERID') or it.get('manufacturerId') or '').strip()
+        uom = str(it.get('uom') or it.get('UOM') or it.get('UNITOFMEASUREMENT') or '').strip()
+        params = {
+            'billno': bill_no,
+            'slno': slno,
+            'manuf': manuf or None,
+            'uom': uom or None,
+            'itemcode': itemcode or None,
+        }
+        updated = False
+        try:
+            cur.execute(f"""
+                UPDATE {HOLD_DTL_TABLE_NAME}
+                SET MANUFACTURERID = :manuf, UNITOFMEASUREMENT = :uom
+                WHERE BILLNO = :billno AND SLNO = :slno
+            """, params)
+            updated = (cur.rowcount or 0) > 0
+        except oracledb.Error as e:
+            if 'ORA-00904' not in str(e).upper() and '00904' not in str(e).upper():
+                print(f"[Hold] TEMPBILLDTL patch: {e}")
+            try:
+                cur.execute(f"""
+                    UPDATE {HOLD_DTL_TABLE_NAME}
+                    SET MANUFACTURERID = :manuf
+                    WHERE BILLNO = :billno AND SLNO = :slno
+                """, params)
+                updated = (cur.rowcount or 0) > 0
+            except oracledb.Error:
+                pass
+        if not updated and itemcode:
+            try:
+                cur.execute(f"""
+                    UPDATE {HOLD_DTL_TABLE_NAME}
+                    SET MANUFACTURERID = :manuf, UNITOFMEASUREMENT = :uom
+                    WHERE BILLNO = :billno AND UPPER(TRIM(TO_CHAR(ITEMCODE))) = UPPER(TRIM(:itemcode))
+                      AND SLNO = :slno
+                """, params)
+            except oracledb.Error:
+                try:
+                    cur.execute(f"""
+                        UPDATE {HOLD_DTL_TABLE_NAME}
+                        SET MANUFACTURERID = :manuf
+                        WHERE BILLNO = :billno AND UPPER(TRIM(TO_CHAR(ITEMCODE))) = UPPER(TRIM(:itemcode))
+                          AND SLNO = :slno
+                    """, params)
+                except oracledb.Error:
+                    pass
+        slno += 1
+
+
+def _itemmaster_baseuom_for_barcode(cur, barcode):
+    """ITEMMASTER base UOM when barcode matches manufacturerid or itemcode."""
+    barcode = str(barcode or '').strip()
+    if not barcode:
+        return None
+    try:
+        cur.execute(f"""
+            SELECT baseuom FROM itemmaster
+            WHERE (
+                (manufacturerid IS NOT NULL AND (
+                    TRIM(TO_CHAR(manufacturerid, '{_ORACLE_NUM_FMT}')) = TRIM(:code)
+                    OR UPPER(TRIM(TO_CHAR(manufacturerid))) = UPPER(:code)
+                    OR TRIM(manufacturerid) = TRIM(:code)
+                ))
+                OR UPPER(TRIM(TO_CHAR(itemcode))) = UPPER(TRIM(:code))
+            ) AND ROWNUM = 1
+        """, code=barcode)
+        row = cur.fetchone()
+        if row and row[0] is not None and str(row[0]).strip():
+            return str(row[0]).strip()
+    except oracledb.Error:
+        try:
+            cur.execute("""
+                SELECT baseuom FROM itemmaster
+                WHERE UPPER(TRIM(TO_CHAR(itemcode))) = UPPER(TRIM(:code)) AND ROWNUM = 1
+            """, code=barcode)
+            row = cur.fetchone()
+            if row and row[0] is not None and str(row[0]).strip():
+                return str(row[0]).strip()
+        except oracledb.Error:
+            pass
+    return None
+
+
+def _resolve_uom_and_factor_by_barcode(cur, barcode, item_code=None, saved_uom=None, master_details=None):
+    """
+    Resolve UOM and conversion factor for a cart line on fetch (hold / login / cart restore).
+    Checks ITEMALTERNATEUOMMAP by MANUFACTURERID (barcode), then itemcode+UOM, then ITEMMASTER.
+    """
+    master_details = master_details or {}
+    barcode = str(barcode or '').strip()
+    item_code = str(item_code or '').strip()
+    saved_uom = str(saved_uom or '').strip()
+
+    uom = saved_uom or None
+    conversion_factor = 1.0
+    from_alternate = False
+    retail_price = None
+
+    if barcode:
+        ic, _loc, rp, alt_uom, cf = _resolve_itemcode_location_from_alternate(
+            cur, barcode, manufacturer_id_only=True
+        )
+        if ic:
+            from_alternate = True
+            if not item_code:
+                item_code = str(ic).strip()
+            if alt_uom:
+                uom = alt_uom
+            if rp is not None:
+                retail_price = rp
+            if cf is not None:
+                try:
+                    conversion_factor = float(cf)
+                except (TypeError, ValueError):
+                    conversion_factor = 1.0
+            else:
+                cf2 = _lookup_conversion_factor_for_line(
+                    cur, barcode=barcode, item_code=item_code, alternate_uom=uom or saved_uom
+                )
+                if cf2 is not None:
+                    conversion_factor = cf2
+
+    if not from_alternate and item_code and saved_uom:
+        cf3 = _lookup_conversion_factor_for_line(cur, item_code=item_code, alternate_uom=saved_uom)
+        if cf3 is not None and cf3 != 1.0:
+            from_alternate = True
+            uom = saved_uom
+            conversion_factor = cf3
+
+    if not from_alternate:
+        base = None
+        if barcode:
+            base = _itemmaster_baseuom_for_barcode(cur, barcode)
+        if not base:
+            base = str(master_details.get('baseuom') or '').strip() or None
+        if base:
+            uom = base
+        conversion_factor = 1.0
+    elif from_alternate and conversion_factor == 1.0:
+        cf4 = _lookup_conversion_factor_for_line(
+            cur, barcode=barcode or None, item_code=item_code, alternate_uom=uom
+        )
+        if cf4 is not None and cf4 != 1.0:
+            conversion_factor = cf4
+
+    if uom is None and saved_uom:
+        uom = saved_uom
+
+    return {
+        'uom': uom,
+        'conversionFactor': conversion_factor if conversion_factor is not None else 1.0,
+        'fromAlternate': from_alternate,
+        'retailPrice': retail_price,
+    }
+
+
+def _set_item_uom_factor_fields(item, uom, factor):
+    """Write UOM and factor onto cart line dict (all key variants the frontend uses)."""
+    if uom is not None and str(uom).strip():
+        u = str(uom).strip()
+        item['uom'] = u
+        item['UOM'] = u
+    try:
+        fac = float(factor) if factor is not None else 1.0
+    except (TypeError, ValueError):
+        fac = 1.0
+    item['conversionFactor'] = fac
+    item['CONVERSIONFACTOR'] = fac
+    item['factor'] = fac
+    item['Factor'] = fac
+
+
+def _enrich_cart_line_alternate_uom(cur, item, master_details=None):
+    """Re-fetch UOM/factor barcode-wise from ITEMALTERNATEUOMMAP + ITEMMASTER on cart restore."""
+    master_details = master_details or {}
+    barcode = str(
+        item.get('manufactureId') or item.get('MANUFACTURERID') or item.get('manufacturerId') or ''
+    ).strip()
+    item_code = str(item.get('ITEMCODE') or item.get('id') or item.get('itemcode') or '').strip()
+    saved_uom = str(item.get('uom') or item.get('UOM') or '').strip()
+
+    resolved = _resolve_uom_and_factor_by_barcode(
+        cur, barcode, item_code=item_code, saved_uom=saved_uom, master_details=master_details
+    )
+    _set_item_uom_factor_fields(item, resolved.get('uom'), resolved.get('conversionFactor'))
+
+    rp = resolved.get('retailPrice')
+    if rp is not None and item.get('price') is None:
+        try:
+            item['price'] = float(rp)
+        except (TypeError, ValueError):
+            pass
+
+    conv_factor = resolved.get('conversionFactor')
+
+    if not item.get('name'):
+        item['name'] = master_details.get('name') or ''
+    if not item.get('ITEMNAMEARA'):
+        item['ITEMNAMEARA'] = master_details.get('itemnameara') or ''
+
+    cp = master_details.get('costprice')
+    if cp is not None and item.get('costPrice') is None and item.get('COSTPRICE') is None:
+        try:
+            cp_f = float(cp)
+            if resolved.get('fromAlternate') and conv_factor is not None:
+                item['costPrice'] = float(conv_factor) * cp_f
+            else:
+                item['costPrice'] = cp_f
+            item['COSTPRICE'] = item['costPrice']
+        except (TypeError, ValueError):
+            item['costPrice'] = cp
+            item['COSTPRICE'] = cp
+
+    ac = master_details.get('averagecost')
+    if ac is not None and item.get('avgCost') is None and item.get('AVERAGECOST') is None:
+        item['avgCost'] = ac
+        item['AVERAGECOST'] = ac
+
+    pa = master_details.get('prevamount')
+    if pa is not None and item.get('prevAmount') is None and item.get('PREVAMOUNT') is None:
+        item['prevAmount'] = pa
+        item['PREVAMOUNT'] = pa
+
+    return item
+
+
+def _load_cart_items_from_tempbilldtl(cur, bill_no):
+    """Build cart lines from TEMPBILLDTL and enrich UOM/factor from ITEMALTERNATEUOMMAP."""
+    items = []
+    dtl_rows, cols = _fetch_tempbilldtl_rows(cur, bill_no)
+    for row in dtl_rows:
+        items.append(_tempbilldtl_row_to_cart_item(row, cols))
+    itemcodes = [
+        str(it.get("ITEMCODE") or it.get("id") or "").strip()
+        for it in items
+        if it.get("ITEMCODE") or it.get("id")
+    ]
+    details_map = _get_item_details_from_master(cur, itemcodes) if itemcodes else {}
+    for it in items:
+        code = str(it.get("ITEMCODE") or it.get("id") or "").strip()
+        _enrich_cart_line_alternate_uom(cur, it, details_map.get(code) or {})
+    return items
+
+
 def _get_item_names_from_master(cur, itemcodes):
     """Look up ITEMNAME from itemmaster by ITEMCODE; also resolve via ITEMALTERNATEUOMMAP. Returns dict itemcode_str -> itemname."""
     details = _get_item_details_from_master(cur, itemcodes)
     return {k: (v.get('name') or '') for k, v in details.items()}
+
+
+def _resolve_billdtl_uom(cur, item_code, line, im_row, conv_mult=1.0, location_code=None):
+    """UNITOFMEASUREMENT for BILLDTL/BILLDTLHISTORY: cart line uom, else ALTERNATEUOMCODE when factor != 1, else ITEMMASTER BASEUOM."""
+    for key in ('uom', 'UOM', 'UNITOFMEASUREMENT', 'BASEUOM', 'baseuom', 'alternateUomCode', 'ALTERNATEUOMCODE'):
+        _raw = (line or {}).get(key)
+        if _raw is not None and str(_raw).strip():
+            return str(_raw).strip()
+    base_uom = str((im_row or {}).get('baseuom') or '').strip() or None
+    try:
+        cf = float(conv_mult) if conv_mult is not None else 1.0
+    except (TypeError, ValueError):
+        cf = 1.0
+    if cf != 1.0 and item_code:
+        try:
+            params = {'code': item_code, 'cf': cf}
+            sql = """
+                SELECT ALTERNATEUOMCODE FROM ITEMALTERNATEUOMMAP
+                WHERE UPPER(TRIM(TO_CHAR(ITEMCODE))) = UPPER(TRIM(TO_CHAR(:code)))
+                  AND CONVERSIONFACTOR = :cf
+            """
+            if location_code:
+                sql += " AND (LOCATIONCODE IS NULL OR UPPER(TRIM(LOCATIONCODE)) = UPPER(TRIM(:loc)))"
+                params['loc'] = location_code
+            sql += " AND ROWNUM = 1"
+            cur.execute(sql, params)
+            row = cur.fetchone()
+            if row and row[0] is not None and str(row[0]).strip():
+                return str(row[0]).strip()
+        except oracledb.Error:
+            pass
+    return base_uom
 
 
 def _get_item_details_from_master(cur, itemcodes):
@@ -3066,10 +4102,10 @@ def _ensure_billhdrhistory(cur):
 
 
 def _ensure_billhdr_cardamount_column(cur):
-    """Add CARDAMOUNT to BILLHDR / BILLHDRHISTORY when missing (card portion for split payment)."""
+    """Add CARDAMOUNT to BILLHDR / BILLHDRHISTORY when missing (card portion for split payment) with DEFAULT 0."""
     for tbl in (BILLHDR_TABLE_NAME, BILLHDRHISTORY_TABLE_NAME):
         try:
-            cur.execute(f"ALTER TABLE {tbl} ADD (CARDAMOUNT NUMBER)")
+            cur.execute(f"ALTER TABLE {tbl} ADD (CARDAMOUNT NUMBER DEFAULT 0)")
         except oracledb.Error as e:
             err_str = str(e).upper()
             if (
@@ -3080,7 +4116,10 @@ def _ensure_billhdr_cardamount_column(cur):
                 or 'ORA-01031' in err_str
                 or '01031' in err_str
             ):
-                pass
+                try:
+                    cur.execute(f"ALTER TABLE {tbl} MODIFY (CARDAMOUNT DEFAULT 0)")
+                except oracledb.Error:
+                    pass
             else:
                 pass
 
@@ -3164,12 +4203,31 @@ def _billtype_from_invoicecode(invoice_code):
     return 'C'
 
 
-def _prevcardno_from_customer(customer_code):
-    """PREVCARDNO stores the same value as CUSTOMERCODE (VARCHAR2); NUMBER columns fall back in _execute_hdr_ext_safe."""
+# BILLHDRHISTORY reporting: C/R only; returns use same type with negative NETBILLAMOUNT (not a separate bill type).
+_SQL_BILLTYPE_CR = "TRIM(BILLTYPE) IN ('C', 'R')"
+_SQL_BILL_IS_SALE = f"({_SQL_BILLTYPE_CR} AND NVL(NETBILLAMOUNT, 0) > 0)"
+_SQL_BILL_IS_RETURN = f"({_SQL_BILLTYPE_CR} AND NVL(NETBILLAMOUNT, 0) < 0)"
+_SQL_BILL_IS_RETURN_H = "(TRIM(h.BILLTYPE) IN ('C', 'R') AND NVL(h.NETBILLAMOUNT, 0) < 0)"
+_SQL_BILL_IS_SALE_H = "(TRIM(h.BILLTYPE) IN ('C', 'R') AND NVL(h.NETBILLAMOUNT, 0) > 0)"
+
+
+def _bill_hdr_is_sales_return(bill_type, net_amount):
+    """True when header is C/R and net is negative (cash return C, credit return R)."""
+    bt = str(bill_type or '').strip().upper()
+    if bt not in ('C', 'R'):
+        return False
+    return _to_float(net_amount, 0) < 0
+
+
+def _prevcardno_for_billhdr(customer_code, data):
+    """Resolve BILLHDR.PREVCARDNO: explicit client value, else bill CUSTOMERCODE."""
+    _pc = data.get('prevCardNo') or data.get('prev_card_no') or data.get('PREVCARDNO')
+    if _pc is not None and str(_pc).strip() != '':
+        return str(_pc).strip()
     if customer_code is None:
         return None
-    s = str(customer_code).strip()
-    return s if s else None
+    code_s = str(customer_code).strip()
+    return code_s if code_s else None
 
 
 def _billdtl_store_index(store_val):
@@ -3348,12 +4406,187 @@ def _bill_date_business_iso_from_request(data):
     return head
 
 
+def _bill_session_bind(bill_no, location_code, counter_code):
+    try:
+        bn = int(bill_no)
+    except (TypeError, ValueError):
+        bn = bill_no
+    loc = str(location_code or '').strip() or None
+    cc = str(counter_code or '').strip() or None
+    return {'billno': bn, 'loc': loc, 'cc': cc}
+
+
+def _sql_where_billno_and_session(table_alias=None):
+    """Match BILLNO plus counter and location (caller must supply :cc and :loc)."""
+    p = f'{table_alias}.' if table_alias else ''
+    return f"""
+        {p}BILLNO = :billno
+        AND UPPER(TRIM(TO_CHAR({p}COUNTERCODE))) = UPPER(TRIM(TO_CHAR(:cc)))
+        AND UPPER(TRIM(TO_CHAR({p}LOCATIONCODE))) = UPPER(TRIM(TO_CHAR(:loc)))
+    """
+
+
+def _bill_paid_on_session(cur, bill_no, location_code, counter_code):
+    """True if BILLHDR/HISTORY already has this BILLNO on this counter and location."""
+    bind = _bill_session_bind(bill_no, location_code, counter_code)
+    if not bind.get('cc') or not bind.get('loc'):
+        return False
+    where_sess = _sql_where_billno_and_session()
+    for tbl in (BILLHDRHISTORY_TABLE_NAME, BILLHDR_TABLE_NAME):
+        try:
+            cur.execute(
+                f"SELECT 1 FROM {tbl} WHERE {where_sess} AND ROWNUM = 1",
+                bind,
+            )
+            if cur.fetchone():
+                return True
+        except oracledb.Error:
+            continue
+    return False
+
+
+def _bill_paid_on_other_session(cur, bill_no, location_code, counter_code):
+    """True if BILLHDR/HISTORY already has this BILLNO on a different counter or location."""
+    bind = _bill_session_bind(bill_no, location_code, counter_code)
+    cc = bind['cc']
+    loc = bind['loc']
+    if not cc and not loc:
+        return False
+    for tbl in (BILLHDRHISTORY_TABLE_NAME, BILLHDR_TABLE_NAME):
+        try:
+            cur.execute(
+                f"""
+                SELECT COUNTERCODE, LOCATIONCODE FROM {tbl}
+                WHERE BILLNO = :billno AND ROWNUM = 1
+                """,
+                {'billno': bind['billno']},
+            )
+            row = cur.fetchone()
+        except oracledb.Error:
+            row = None
+        if not row:
+            continue
+        ex_cc = str(row[0] or '').strip() if row[0] is not None else ''
+        ex_loc = str(row[1] or '').strip() if len(row) > 1 and row[1] is not None else ''
+        if cc and ex_cc and cc.upper() != ex_cc.upper():
+            return True
+        if loc and ex_loc and loc.upper() != ex_loc.upper():
+            return True
+    return False
+
+
+def _bill_exists_in_hdr(cur, bill_no):
+    """True if BILLNO exists in BILLHDR or BILLHDRHISTORY (any location/counter)."""
+    bn = _to_int(bill_no, None)
+    if bn is None:
+        return False
+    for tbl in (BILLHDRHISTORY_TABLE_NAME, BILLHDR_TABLE_NAME):
+        try:
+            cur.execute(
+                f"SELECT 1 FROM {tbl} WHERE BILLNO = :billno AND ROWNUM = 1",
+                {"billno": bn},
+            )
+            if cur.fetchone():
+                return True
+        except oracledb.Error:
+            continue
+    return False
+
+
+def _max_billno_from_billnotable(cur):
+    """Highest BILLNO in BILLNOTABLE only."""
+    try:
+        cur.execute(f"SELECT NVL(MAX(BILLNO), 0) FROM {BILLNO_TABLE_NAME}")
+        row = cur.fetchone()
+        return _to_int(row[0], 0) if row else 0
+    except oracledb.Error as e:
+        err_str = str(e).upper()
+        if 'ORA-01722' in err_str or '01722' in err_str:
+            return 0
+        raise
+
+
+def _next_available_billno(cur):
+    """MAX(BILLNOTABLE.BILLNO)+1, skipping numbers already in BILLHDR / BILLHDRHISTORY."""
+    candidate = _max_billno_from_billnotable(cur) + 1
+    while _bill_exists_in_hdr(cur, candidate):
+        candidate += 1
+    return candidate
+
+
+def _open_billno_for_counter_reuse(cur, counter_code, location_code=None):
+    """Reuse lowest open BILLNOTABLE row (FLAG=N) for this counter if not already paid in BILLHDR/HISTORY."""
+    cc = str(counter_code or '').strip() or None
+    if not cc:
+        return None
+    try:
+        cur.execute(
+            f"""
+            SELECT BILLNO FROM (
+                SELECT BILLNO FROM {BILLNO_TABLE_NAME}
+                WHERE COUNTERCODE = :cc AND (FLAG = 'N' OR FLAG IS NULL)
+                ORDER BY BILLNO
+            ) WHERE ROWNUM = 1
+            """,
+            {"cc": cc},
+        )
+        row = cur.fetchone()
+        if row and row[0] is not None:
+            existing_billno = _to_int(row[0], None)
+            if existing_billno is not None:
+                if _bill_exists_in_hdr(cur, existing_billno):
+                    print(
+                        f'[BillNo] open bill {existing_billno} for counter {cc} '
+                        f'already in BILLHDR/HISTORY; allocating new billno'
+                    )
+                    return None
+                if _bill_paid_on_other_session(cur, existing_billno, location_code, cc):
+                    print(
+                        f'[BillNo] open bill {existing_billno} for counter {cc} '
+                        f'already paid elsewhere; allocating new billno'
+                    )
+                    return None
+                return existing_billno
+    except oracledb.Error as e:
+        err_str = str(e).upper()
+        if 'ORA-00904' not in err_str and '00904' not in err_str and 'ORA-01722' not in err_str and '01722' not in err_str:
+            raise
+    return None
+
+
+def _mark_billnotable_paid(cur, bill_no, counter_code=None):
+    """Set FLAG=Y on BILLNOTABLE for this bill; scope by counter when possible."""
+    bill_no = _to_int(bill_no, None)
+    if bill_no is None:
+        return
+    cc = str(counter_code or '').strip() or None
+    if cc:
+        try:
+            cur.execute(
+                f"""
+                UPDATE {BILLNO_TABLE_NAME} SET FLAG = 'Y'
+                WHERE BILLNO = :billno
+                  AND UPPER(TRIM(TO_CHAR(COUNTERCODE))) = UPPER(TRIM(TO_CHAR(:cc)))
+                """,
+                {'billno': bill_no, 'cc': cc},
+            )
+            return
+        except oracledb.Error as e:
+            err_str = str(e).upper()
+            if 'ORA-00904' not in err_str and '00904' not in err_str:
+                raise
+    cur.execute(
+        f"UPDATE {BILLNO_TABLE_NAME} SET FLAG = 'Y' WHERE BILLNO = :billno",
+        {'billno': bill_no},
+    )
+
+
 @app.route('/api/billno/next', methods=['GET', 'POST'])
 def create_next_billno():
     """
-    Create next bill no:
-    1) If counter code given: check DB for existing row with same COUNTERCODE and FLAG='N'; if found, return that BILLNO.
-    2) Else: new_billno = MAX(BILLNO)+1, insert into BILLNOTABLE, return new_billno.
+    Allocate bill number:
+    1) If counter code given: reuse existing BILLNOTABLE row (same COUNTERCODE, FLAG='N') when not in BILLHDR/HISTORY.
+    2) Else: MAX(BILLNO)+1 from BILLNOTABLE, skip numbers in BILLHDR/HISTORY, insert BILLNOTABLE FLAG='N'.
     """
     data = request.get_json(silent=True) or {}
     _bill_date_lookup = dict(data)
@@ -3366,6 +4599,8 @@ def create_next_billno():
     _cnt = data.get('counterCode') or data.get('counter_code') or request.args.get('counterCode') or request.args.get('counter_code')
     counter_code = str(_cnt).strip() if _cnt is not None else ''
     counter_code = counter_code or None
+    _loc = data.get('locationCode') or data.get('location_code') or request.args.get('locationCode') or request.args.get('location_code')
+    location_code_val = str(_loc).strip() if _loc is not None and str(_loc).strip() != '' else None
     conn = _get_connection()
     if not conn:
         return jsonify({"error": "Database unavailable", "billNo": None}), 503
@@ -3374,39 +4609,10 @@ def create_next_billno():
         cur = conn.cursor()
         _ensure_billnotable(cur)
         counter_code_val = (counter_code if isinstance(counter_code, str) else str(counter_code or '').strip()) or None
-        # First: if we have a counter code, try to reuse an existing BILLNO for this counter with FLAG='N'
-        if counter_code_val:
-            try:
-                cur.execute(f"""
-                    SELECT BILLNO FROM (
-                        SELECT BILLNO FROM {BILLNO_TABLE_NAME}
-                        WHERE COUNTERCODE = :cc AND (FLAG = 'N' OR FLAG IS NULL)
-                        ORDER BY BILLNO
-                    ) WHERE ROWNUM = 1
-                """, {"cc": counter_code_val})
-                row = cur.fetchone()
-                if row and row[0] is not None:
-                    existing_billno = _to_int(row[0], None)
-                    if existing_billno is not None:
-                        return jsonify({"ok": True, "billNo": existing_billno})
-            except oracledb.Error as e:
-                err_str = str(e).upper()
-                # ORA-00904: invalid identifier; ORA-01722: invalid number (e.g. COUNTERCODE type mismatch)
-                if 'ORA-00904' not in err_str and '00904' not in err_str and 'ORA-01722' not in err_str and '01722' not in err_str:
-                    raise
-        # Else: no matching row or no counter code – create new: MAX(BILLNO)+1, insert
-        try:
-            cur.execute(f"SELECT NVL(MAX(BILLNO), 0) AS LAST_BILLNO FROM {BILLNO_TABLE_NAME}")
-            row = cur.fetchone()
-            last_billno = _to_int(row[0], 0) if row else 0
-        except oracledb.Error as e:
-            err_str = str(e).upper()
-            if 'ORA-01722' in err_str or '01722' in err_str:
-                # BILLNO may be VARCHAR with non-numeric data; use 0 and rely on insert
-                last_billno = 0
-            else:
-                raise
-        new_billno = int(last_billno + 1)
+        reused_billno = _open_billno_for_counter_reuse(cur, counter_code_val, location_code_val)
+        if reused_billno is not None:
+            return jsonify({"ok": True, "billNo": reused_billno, "reused": True})
+        new_billno = _next_available_billno(cur)
         try:
             cur.execute(
                 f"INSERT INTO {BILLNO_TABLE_NAME} (BILLNO, FLAG, BILLDATE, BILLTIME, COUNTERCODE) VALUES (:billno, 'N', {_billdate_sql}, TO_CHAR(SYSDATE, 'HH12:MI:SS AM'), :countercode)",
@@ -3463,12 +4669,12 @@ def mark_bill_paid():
     if not conn:
         return jsonify({"ok": False, "error": "Database unavailable"}), 503
     cur = None
+    _cnt = data.get('counterCode') or data.get('counter_code')
+    counter_code = str(_cnt).strip() if _cnt is not None else None
+    counter_code = counter_code or None
     try:
         cur = conn.cursor()
-        cur.execute(
-            f"UPDATE {BILLNO_TABLE_NAME} SET FLAG = 'Y' WHERE BILLNO = :billno",
-            {"billno": bill_no}
-        )
+        _mark_billnotable_paid(cur, bill_no, counter_code)
         conn.commit()
         return jsonify({"ok": True})
     except oracledb.Error as e:
@@ -3681,7 +4887,7 @@ def _customer_row_for_pos(cur, customer_code):
                 c.invoicecode,
                 c.currentcreditamount,
                 c.creditlimit,
-                NVL(c.points, 0) AS points,
+                GREATEST(0, NVL(c.points, 0)) AS points,
                 NVL(TRIM(c.mobile), '') AS mobile
             FROM customer c
             LEFT JOIN tblcustomercategory g ON c.customercategory = g.categorycode
@@ -3697,7 +4903,7 @@ def _customer_row_for_pos(cur, customer_code):
                 c.invoicecode,
                 c.currentcreditamount,
                 c.creditlimit,
-                NVL(c.points, 0) AS points,
+                GREATEST(0, NVL(c.points, 0)) AS points,
                 NVL(TRIM(c.mobile), '') AS mobile,
                 NVL(TRIM(c.nationality), '') AS nationality
             FROM customer c
@@ -3719,6 +4925,92 @@ def _customer_row_for_pos(cur, customer_code):
                 continue
             return None
     return None
+
+
+TBLSALESCHANNEL_TABLE_NAME = 'TBLSALESCHANNEL'
+_DEFAULT_SALES_CHANNEL_DESCRIPTION = 'DIRECT'
+
+
+def _sales_channel_description_from_db(cur, channel_code):
+    """Return TBLSALESCHANNEL.DESCRIPTION for CODE, or None."""
+    if channel_code is None:
+        return None
+    try:
+        code_val = int(float(str(channel_code).strip()))
+    except (TypeError, ValueError):
+        return None
+    try:
+        cur.execute(
+            f"""
+            SELECT TRIM(sc.DESCRIPTION)
+            FROM {TBLSALESCHANNEL_TABLE_NAME} sc
+            WHERE sc.CODE = :code AND ROWNUM = 1
+            """,
+            {"code": code_val},
+        )
+        row = cur.fetchone()
+        if row and row[0] is not None:
+            desc = str(row[0]).strip()
+            if desc:
+                return desc
+    except oracledb.Error:
+        pass
+    return None
+
+
+@app.route('/api/sales-channels', methods=['GET', 'OPTIONS'])
+def list_sales_channels():
+    """Sales channels from TBLSALESCHANNEL (CODE, DESCRIPTION)."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    conn = _get_connection()
+    if not conn:
+        return jsonify({"ok": False, "channels": [], "error": "Database unavailable"}), 503
+    cur = None
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            f"""
+            SELECT TRIM(sc.CODE), TRIM(sc.DESCRIPTION)
+            FROM {TBLSALESCHANNEL_TABLE_NAME} sc
+            WHERE sc.CODE IS NOT NULL
+            ORDER BY sc.CODE
+            """
+        )
+        rows = cur.fetchall()
+        channels = []
+        for row in rows:
+            if not row or row[0] is None:
+                continue
+            try:
+                code_val = int(float(str(row[0]).strip()))
+            except (TypeError, ValueError):
+                continue
+            desc_val = ''
+            if len(row) > 1 and row[1] is not None:
+                desc_val = str(row[1]).strip()
+            if not desc_val:
+                desc_val = str(code_val)
+            channels.append({
+                "code": code_val,
+                "description": desc_val,
+                "CODE": code_val,
+                "DESCRIPTION": desc_val,
+            })
+        return jsonify({"ok": True, "channels": channels})
+    except oracledb.Error as e:
+        print(f'[sales-channels] {e}')
+        return jsonify({"ok": False, "channels": [], "error": str(e)}), 500
+    finally:
+        if cur:
+            try:
+                cur.close()
+            except Exception:
+                pass
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 @app.route('/api/billing/default-customer', methods=['GET', 'OPTIONS'])
@@ -3779,7 +5071,7 @@ def billing_default_customer():
 
 @app.route('/api/billdtl/insert', methods=['POST'])
 def billdtl_insert():
-    """On Pay: insert BILLHDR + BILLHDRHISTORY (header), then BILLDTL + BILLDTLHISTORY (lines). BILLTYPE is C or R only (from INVOICECODE)."""
+    """On Pay: insert-only BILLHDR/HISTORY + BILLDTL/HISTORY (no delete/re-insert). Rejects if bill already paid (409)."""
     data = request.get_json(silent=True) or {}
     _loc = data.get('locationCode') or data.get('location_code')
     location_code = str(_loc).strip() if _loc is not None else ''
@@ -3806,6 +5098,8 @@ def billdtl_insert():
         net_bill_amount = float(_net) if _net is not None and _net != '' else None
     except (TypeError, ValueError):
         net_bill_amount = None
+    if is_sales_return and net_bill_amount is not None:
+        net_bill_amount = -abs(net_bill_amount)
     _cust_code = data.get('customerCode') or data.get('customer_code') or data.get('CUSTOMERCODE')
     customer_code = str(_cust_code).strip() if _cust_code is not None and _cust_code != '' else None
     _cust_name = data.get('customerName') or data.get('customer_name') or data.get('CUSTOMERNAME')
@@ -3814,16 +5108,28 @@ def billdtl_insert():
     employee_code = str(_ec_hdr).strip() if _ec_hdr is not None and str(_ec_hdr).strip() != '' else None
     if employee_code is None:
         employee_code = _employee_code_from_request()
-    _cb_hdr = data.get('createdBy') or data.get('created_by') or data.get('CREATEDBY')
-    if _cb_hdr is not None and str(_cb_hdr).strip() != '':
-        created_by = str(_cb_hdr).strip()
+    _uid_hdr = data.get('userId') or data.get('userid') or data.get('USERID')
+    if _uid_hdr is not None and str(_uid_hdr).strip() != '':
+        created_by = str(_uid_hdr).strip()
     else:
-        created_by = _username_from_request() or _employee_code_from_request() or 'POS'
+        created_by = _employee_code_from_request() or 'POS'
     _card_amt = data.get('cardAmount') or data.get('card_amount') or data.get('CARDAMOUNT')
     try:
-        card_amount = float(_card_amt) if _card_amt is not None and _card_amt != '' else None
+        card_amount = float(_card_amt) if _card_amt is not None and _card_amt != '' else 0.0
     except (TypeError, ValueError):
-        card_amount = None
+        card_amount = 0.0
+    _red_pt = data.get('redemptionPoints') or data.get('redemption_points') or data.get('REDEMPTIONPOINT')
+    try:
+        redemption_points = int(float(_red_pt)) if _red_pt is not None and _red_pt != '' else 0
+    except (TypeError, ValueError):
+        redemption_points = 0
+    redemption_points = max(0, redemption_points)
+    _red_amt = data.get('redemptionAmount') or data.get('redemption_amount') or data.get('REDEMPTIONAMOUNT')
+    try:
+        redemption_amount = float(_red_amt) if _red_amt is not None and _red_amt != '' else 0.0
+    except (TypeError, ValueError):
+        redemption_amount = 0.0
+    redemption_amount = max(0.0, redemption_amount)
     try:
         ca_num = float(card_amount) if card_amount is not None else 0.0
     except (TypeError, ValueError):
@@ -3835,10 +5141,34 @@ def billdtl_insert():
     # BILLHDR.CARDNO is NOT NULL in many schemas; bind 0 when no card was captured.
     if card_no is None:
         card_no = 0
+    _ord = data.get('orderNo') or data.get('order_no') or data.get('ORDERNO')
+    try:
+        order_no_val = int(float(_ord)) if _ord is not None and _ord != '' else 0
+    except (TypeError, ValueError):
+        order_no_val = 0
+    _channel = data.get('channelCode') or data.get('channel_code') or data.get('CHANNELCODE')
+    try:
+        channel_code = int(float(_channel)) if _channel is not None and _channel != '' else 1
+    except (TypeError, ValueError):
+        channel_code = 1
+    _channel_desc = (
+        data.get('channelDescription')
+        or data.get('channel_description')
+        or data.get('CHANNELDESCRIPTION')
+        or data.get('DESCRIPTION')
+        or data.get('description')
+    )
+    channel_description = (
+        str(_channel_desc).strip() if _channel_desc is not None and str(_channel_desc).strip() != '' else None
+    )
     try:
         bill_no = int(bill_no)
     except (TypeError, ValueError):
         return jsonify({"ok": False, "error": "billNo must be a number"}), 400
+    if not counter_code:
+        return jsonify({"ok": False, "error": "counterCode required for payment"}), 400
+    if not location_code:
+        return jsonify({"ok": False, "error": "locationCode required for payment"}), 400
     if not isinstance(items, list):
         return jsonify({"ok": False, "error": "items must be an array"}), 400
     item_count = len(items)
@@ -3864,12 +5194,35 @@ def billdtl_insert():
         _ensure_billhdr_extended_columns(cur)
         _ensure_billdtl(cur)
         _ensure_billdtlhistory(cur)
+        if _bill_paid_on_other_session(cur, bill_no, location_code, counter_code):
+            return jsonify({
+                "ok": False,
+                "error": (
+                    f"Bill {bill_no} is already paid on another counter or location. "
+                    "Close this bill and take a new bill number (Checkout again or re-login)."
+                ),
+                "code": "BILL_ALREADY_PAID_OTHER_SESSION",
+            }), 409
+        if _bill_paid_on_session(cur, bill_no, location_code, counter_code):
+            return jsonify({
+                "ok": False,
+                "error": (
+                    f"Bill {bill_no} is already paid on this counter. "
+                    "Take a new bill number before the next sale."
+                ),
+                "code": "BILL_ALREADY_PAID",
+            }), 409
+        # Default walk-in customer when none selected on the bill.
         if not customer_code:
             _dc, _dn = _default_customer_from_tbl_countersale(cur, counter_code, location_code)
             if _dc:
                 customer_code = _dc
             if _dn and not customer_name:
                 customer_name = _dn
+        if not channel_description:
+            channel_description = _sales_channel_description_from_db(cur, channel_code)
+        if not channel_description:
+            channel_description = _DEFAULT_SALES_CHANNEL_DESCRIPTION
         # Insert BILLHDR (+ BILLHDRHISTORY): ... NETBILLAMOUNT, CARDAMOUNT, CUSTOMERCODE, CUSTOMERNAME
         _hdr_bind_full = {
             "loc": location_code,
@@ -3907,8 +5260,13 @@ def billdtl_insert():
             "employeecode": hdr_employeecode,
             "createdby": created_by,
             "totalpoint": prev_points,
+            "redemptionpoint": redemption_points,
+            "redemptionamount": redemption_amount,
             "itemcount": item_count,
-            "prev_card_no": _prevcardno_from_customer(customer_code),
+            "prev_card_no": _prevcardno_for_billhdr(customer_code, data),
+            "orderno": order_no_val,
+            "bill_channel_code": channel_code,
+            "bill_address": channel_description,
         }
         for _hdr_tbl in (BILLHDR_TABLE_NAME, BILLHDRHISTORY_TABLE_NAME):
             try:
@@ -3925,8 +5283,8 @@ def billdtl_insert():
                         :loc, :billno, {billdate_hdr_sql}, :billtype, :countercode, 1, 0, :prevpoints,
                         :netbillamount, :cardamount, :cardno, :cardtype, :customercode, :customername,
                         0, :employeecode, TO_CHAR(SYSDATE, 'HH24:MI:SS'), 'N', :createdby, SYSDATE, 'P',
-                        1, 0, 0, 1, 'DIRECT SALE', :prev_card_no, 0,
-                        0, 0, :totalpoint, 0, 0, 'NORMAL', 1, :itemcount
+                        1, 0, :orderno, 1, :bill_address, :prev_card_no, 0,
+                        :redemptionamount, :redemptionpoint, :totalpoint, 0, 0, 'NORMAL', :bill_channel_code, :itemcount
                     )
                     """,
                     _hdr_bind(_hdr_bind_ext),
@@ -3971,65 +5329,22 @@ def billdtl_insert():
                                     )
                                 except oracledb.Error:
                                     raise
-                elif 'ORA-00001' not in err_str and '00001' not in err_str:
-                    raise
-                try:
-                    _execute_hdr_ext_safe(
-                        cur,
-                        f"""
-                        UPDATE {_hdr_tbl} SET LOCATIONCODE = :loc, BILLDATE = {billdate_hdr_sql}, BILLTYPE = :billtype, COUNTERCODE = :countercode, RESETNO = 1, SESSIONCODE = 0, PREVPOINTS = :prevpoints, NETBILLAMOUNT = :netbillamount, CARDAMOUNT = :cardamount, CARDNO = :cardno, CARDTYPE = :cardtype, CUSTOMERCODE = :customercode, CUSTOMERNAME = :customername, DISCOUNTAMOUNT = 0, EMPLOYEECODE = :employeecode, BILLTIME = TO_CHAR(SYSDATE, 'HH24:MI:SS'), DELFLAG = 'N', CREATEDBY = :createdby, CREATEDDATE = SYSDATE, BILLSTATUS = 'P', SALESMANCODE = 1, TRANSACTIONNO = 0, ORDERNO = 0, ENTRYNO = 1, ADDRESS = 'DIRECT SALE', PREVCARDNO = :prev_card_no, LPONO = 0, REDEMPTIONAMOUNT = 0, REDEMPTIONPOINT = 0, TOTALPOINT = :totalpoint, HELPERCODE1 = 0, HELPERCODE2 = 0, GVTYPE = 'NORMAL', CHANNELCODE = 1, ITEMCOUNT = :itemcount
-                        WHERE BILLNO = :billno
-                        """,
-                        _hdr_bind(_hdr_bind_ext),
-                    )
-                except oracledb.Error as upd_err:
-                    err_str = str(upd_err).upper()
-                    if 'ORA-00904' in err_str or '00904' in err_str:
+                elif 'ORA-00001' in err_str or '00001' in err_str:
+                    if conn:
                         try:
-                            cur.execute(
-                                f"""
-                                UPDATE {_hdr_tbl} SET LOCATIONCODE = :loc, BILLDATE = {billdate_hdr_sql}, BILLTYPE = :billtype, COUNTERCODE = :countercode, RESETNO = 1, SESSIONCODE = 0, PREVPOINTS = :prevpoints, NETBILLAMOUNT = :netbillamount, CARDAMOUNT = :cardamount, CARDNO = :cardno, CARDTYPE = :cardtype, CUSTOMERCODE = :customercode, CUSTOMERNAME = :customername
-                                WHERE BILLNO = :billno
-                                """,
-                                _hdr_bind(_hdr_bind_full),
-                            )
-                        except oracledb.Error:
-                            try:
-                                cur.execute(
-                                    f"""
-                                    UPDATE {_hdr_tbl} SET LOCATIONCODE = :loc, BILLDATE = {billdate_hdr_sql}, BILLTYPE = :billtype, COUNTERCODE = :countercode, RESETNO = 1, SESSIONCODE = 0, PREVPOINTS = :prevpoints, NETBILLAMOUNT = :netbillamount, CARDAMOUNT = :cardamount, CUSTOMERCODE = :customercode, CUSTOMERNAME = :customername
-                                    WHERE BILLNO = :billno
-                                    """,
-                                    _hdr_bind(_hdr_bind_no_card),
-                                )
-                            except oracledb.Error:
-                                try:
-                                    cur.execute(
-                                        f"""
-                                        UPDATE {_hdr_tbl} SET LOCATIONCODE = :loc, BILLDATE = {billdate_hdr_sql}, BILLTYPE = :billtype, COUNTERCODE = :countercode, RESETNO = 1, SESSIONCODE = 0, PREVPOINTS = :prevpoints, NETBILLAMOUNT = :netbillamount, CUSTOMERCODE = :customercode, CUSTOMERNAME = :customername
-                                        WHERE BILLNO = :billno
-                                        """,
-                                        _hdr_bind(_hdr_bind_no_card),
-                                    )
-                                except oracledb.Error:
-                                    cur.execute(
-                                        f"""
-                                        UPDATE {_hdr_tbl} SET LOCATIONCODE = :loc, BILLDATE = {billdate_hdr_sql}, BILLTYPE = :billtype, COUNTERCODE = :countercode, RESETNO = 1, SESSIONCODE = 0, PREVPOINTS = :prevpoints
-                                        WHERE BILLNO = :billno
-                                        """,
-                                        _hdr_bind(_hdr_bind_min),
-                                    )
-                    else:
-                        pass
-        # Remove any existing rows for this bill so insert is idempotent (avoids ORA-00001 on double Pay / re-submit)
-        try:
-            cur.execute(f"DELETE FROM {BILLDTL_TABLE_NAME} WHERE BILLNO = :billno", {"billno": bill_no})
-        except oracledb.Error:
-            pass
-        try:
-            cur.execute(f"DELETE FROM {BILLDTLHISTORY_TABLE_NAME} WHERE BILLNO = :billno", {"billno": bill_no})
-        except oracledb.Error:
-            pass
+                            conn.rollback()
+                        except Exception:
+                            pass
+                    return jsonify({
+                        "ok": False,
+                        "error": (
+                            f"Bill {bill_no} is already paid on this counter. "
+                            "Take a new bill number before the next sale."
+                        ),
+                        "code": "BILL_ALREADY_PAID",
+                    }), 409
+                else:
+                    raise
         _precodes = []
         for _it in items:
             if not _it or not isinstance(_it, dict):
@@ -4054,17 +5369,13 @@ def billdtl_insert():
                 points_val = float(_pt) if _pt is not None and _pt != '' else 0
             except (TypeError, ValueError):
                 points_val = 0
-            # Store from ITEMSTORE by ITEMCODE (normalized, default STORE1)
-            item_store = 'STORE1'
-            try:
-                cur.execute("""
-                    SELECT STORE FROM ITEMSTORE WHERE UPPER(TRIM(TO_CHAR(ITEMCODE))) = UPPER(:code) AND ROWNUM = 1
-                """, code=item_code)
-                row = cur.fetchone()
-                if row and row[0] is not None:
-                    item_store = _normalize_store(row[0]) or 'STORE1'
-            except oracledb.Error:
-                pass
+            # Store: client line, else ITEMSTORE from _get_item_details_from_master (no per-line ITEMSTORE query)
+            _st_line = it.get('store') or it.get('STORE')
+            if _st_line is not None and str(_st_line).strip() != '':
+                item_store = _normalize_store(_st_line) or 'STORE1'
+            else:
+                _im_st = (_im_cost_by_code.get(item_code) or {}).get('store')
+                item_store = _normalize_store(_im_st) or 'STORE1'
             if not item_store or not str(item_store).strip():
                 item_store = 'STORE1'
             store_val = item_store
@@ -4127,13 +5438,13 @@ def billdtl_insert():
             _dtl_bind_full_baseqty = {**_dtl_bind_full, "baseqty": baseqty_val}
             _dtl_bind_no_store_baseqty = {**_dtl_bind_no_store, "baseqty": baseqty_val}
             _im_row_pay = _im_cost_by_code.get(item_code) or {}
-            _base_uom_pay = str(_im_row_pay.get('baseuom') or '').strip() or None
-            _dtl_bind_ext_baseqty_uom = {**_dtl_bind_ext_baseqty, "uom": _base_uom_pay}
-            _dtl_bind_ext_uom = {**_dtl_bind_ext, "uom": _base_uom_pay}
-            _dtl_bind_full_baseqty_uom = {**_dtl_bind_full_baseqty, "uom": _base_uom_pay}
-            _dtl_bind_full_uom = {**_dtl_bind_full, "uom": _base_uom_pay}
-            _dtl_bind_no_store_baseqty_uom = {**_dtl_bind_no_store_baseqty, "uom": _base_uom_pay}
-            _dtl_bind_no_store_uom = {**_dtl_bind_no_store, "uom": _base_uom_pay}
+            _uom_pay = _resolve_billdtl_uom(cur, item_code, it, _im_row_pay, _conv_mult, location_code)
+            _dtl_bind_ext_baseqty_uom = {**_dtl_bind_ext_baseqty, "uom": _uom_pay}
+            _dtl_bind_ext_uom = {**_dtl_bind_ext, "uom": _uom_pay}
+            _dtl_bind_full_baseqty_uom = {**_dtl_bind_full_baseqty, "uom": _uom_pay}
+            _dtl_bind_full_uom = {**_dtl_bind_full, "uom": _uom_pay}
+            _dtl_bind_no_store_baseqty_uom = {**_dtl_bind_no_store_baseqty, "uom": _uom_pay}
+            _dtl_bind_no_store_uom = {**_dtl_bind_no_store, "uom": _uom_pay}
             _dtl_bind_ext_baseqty_uom_avg = {**_dtl_bind_ext_baseqty_uom, "avgcost": avg_cost_val}
             _dtl_bind_ext_uom_avg = {**_dtl_bind_ext_uom, "avgcost": avg_cost_val}
             _dtl_bind_ext_baseqty_avg = {**_dtl_bind_ext_baseqty, "avgcost": avg_cost_val}
@@ -4274,6 +5585,20 @@ def billdtl_insert():
                                     pass
                             if _dtl_ok:
                                 break
+                        if 'ORA-00001' in err_str or '00001' in err_str:
+                            if conn:
+                                try:
+                                    conn.rollback()
+                                except Exception:
+                                    pass
+                            return jsonify({
+                                "ok": False,
+                                "error": (
+                                    f"Bill {bill_no} is already paid on this counter. "
+                                    "Take a new bill number before the next sale."
+                                ),
+                                "code": "BILL_ALREADY_PAID",
+                            }), 409
                         raise
                 if not _dtl_ok:
                     raise _dtl_last_err if _dtl_last_err else RuntimeError("BILLDTL insert failed")
@@ -4383,39 +5708,63 @@ def billdtl_insert():
                         pass
         if dtl_params_pay:
             _insert_itemjournal_and_itemlog(cur, bill_no, location_code, dtl_params_pay, is_sales_return=is_sales_return)
-        # Loyalty: same integer as BILLHDR.PREVPOINTS (int of totalPoints; no fractional points on customer)
-        if customer_code and inserted > 0 and prev_points != 0:
-            try:
-                _pt_delta = -int(prev_points) if is_sales_return else int(prev_points)
-                cur.execute(
-                    """
-                    UPDATE customer
-                    SET points = NVL(points, 0) + :delta
-                    WHERE TRIM(customercode) = TRIM(:custcode)
-                    """,
-                    {"delta": _pt_delta, "custcode": customer_code},
-                )
-            except oracledb.Error as _pt_err:
-                _pt_up = str(_pt_err).upper()
-                if "ORA-00904" in _pt_up or "00904" in _pt_up:
-                    print(f"[BILLDTL] customer.points column missing or invalid; skip loyalty update: {_pt_err}")
-                else:
-                    raise
+        # Points: earn on bill and/or redeem loyalty points (never below 0).
+        if inserted > 0 and customer_code and (prev_points != 0 or redemption_points != 0):
+            _earned = int(prev_points)
+            _redeemed = int(redemption_points)
+            if is_sales_return:
+                _pt_delta = _redeemed - _earned
+            else:
+                _pt_delta = _earned - _redeemed
+            if _pt_delta != 0:
+                try:
+                    cur.execute(
+                        """
+                        UPDATE customer
+                        SET points = GREATEST(0, NVL(points, 0) + :delta)
+                        WHERE TRIM(customercode) = TRIM(:custcode)
+                        """,
+                        {"delta": _pt_delta, "custcode": customer_code},
+                    )
+                except oracledb.Error as _pt_err:
+                    _pt_up = str(_pt_err).upper()
+                    if "ORA-00904" in _pt_up or "00904" in _pt_up:
+                        print(f"[BILLDTL] customer.points column missing or invalid; skip points update: {_pt_err}")
+                    else:
+                        raise
         if inserted > 0:
             try:
                 _clear_draft_temp_cart(cur, bill_no, location_code)
             except oracledb.Error as _tmp_err:
                 print(f"[BILLDTL] clear draft temp cart warning: {_tmp_err}")
+            # Same as /api/billno/paid: mark open bill row paid before commit so the client
+            # does not need a second round-trip for correct FLAG when fetching next bill no.
+            try:
+                _ensure_billnotable(cur)
+                _mark_billnotable_paid(cur, bill_no, counter_code)
+            except oracledb.Error as _bn_err:
+                print(f"[BILLDTL] BILLNOTABLE FLAG=Y update failed: {_bn_err}")
+                raise
         conn.commit()
         if items and inserted == 0:
             return jsonify({"ok": False, "error": "No valid rows inserted (check itemCode/quantity/rate)"}), 400
-        return jsonify({"ok": True, "inserted": inserted})
+        return jsonify({"ok": True, "inserted": inserted, "billMarkedPaid": inserted > 0})
     except oracledb.Error as e:
         if conn:
             try:
                 conn.rollback()
             except Exception:
                 pass
+        err_up = str(e).upper()
+        if 'ORA-00001' in err_up or '00001' in err_up:
+            return jsonify({
+                "ok": False,
+                "error": (
+                    f"Bill {bill_no} is already paid on this counter. "
+                    "Take a new bill number before the next sale."
+                ),
+                "code": "BILL_ALREADY_PAID",
+            }), 409
         print(f"[BILLDTL] insert error: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
     finally:
@@ -4504,6 +5853,366 @@ def bills_by_date():
         return jsonify({"ok": True, "date": date_str, "bills": rows_out})
     except oracledb.Error as e:
         print(f"[Bills] by-date error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+    finally:
+        if cur:
+            try:
+                cur.close()
+            except Exception:
+                pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.route('/api/bills/suspended-by-date', methods=['GET'])
+def bills_suspended_by_date():
+    """Suspended whole bills: TBLCANCELEDHDR with BILLSTATUS='C' (same as suspend POST). Not void-line ('V')."""
+    date_str = (request.args.get('date') or '').strip()
+    location_code = (request.args.get('locationCode') or request.args.get('location_code') or '').strip()
+    counter_code = (request.args.get('counterCode') or request.args.get('counter_code') or '').strip()
+    if not date_str:
+        return jsonify({"ok": False, "error": "date required (YYYY-MM-DD)"}), 400
+    conn = _get_connection()
+    if not conn:
+        return jsonify({"ok": False, "error": "Database unavailable"}), 503
+    cur = None
+    try:
+        cur = conn.cursor()
+        base_where = "TRIM(TO_CHAR(TRUNC(h.BILLDATE), 'YYYY-MM-DD')) = :d AND h.BILLSTATUS = 'C'"
+        bind = {"d": date_str}
+        if location_code:
+            base_where += " AND NVL(TRIM(h.LOCATIONCODE), ' ') = NVL(TRIM(:loccode), ' ') "
+            bind["loccode"] = location_code
+        if counter_code:
+            base_where += " AND NVL(TRIM(h.COUNTERCODE), ' ') = NVL(TRIM(:cntcode), ' ') "
+            bind["cntcode"] = counter_code
+
+        def _fetch_rows(sql):
+            cur.execute(sql, bind)
+            rows = cur.fetchall() or []
+            cols = [c[0] for c in cur.description] if cur.description else []
+            return rows, cols
+
+        rows_out = []
+        sql_attempts = [
+            f"""
+                SELECT h.BILLNO, h.BILLDATE, h.BILLTIME, h.COUNTERCODE, h.LOCATIONCODE,
+                       NVL(h.NETBILLAMOUNT, 0), NVL(h.DISCOUNTAMOUNT, 0), TRIM(h.CUSTOMERCODE)
+                FROM TBLCANCELEDHDR h
+                WHERE {base_where}
+                ORDER BY h.BILLNO DESC, h.BILLTIME DESC
+            """,
+            f"""
+                SELECT h.BILLNO, h.BILLDATE, h.BILLTIME, h.COUNTERCODE, h.LOCATIONCODE,
+                       NVL(h.NETBILLAMOUNT, 0), NVL(h.DISCOUNTAMOUNT, 0), NULL
+                FROM TBLCANCELEDHDR h
+                WHERE {base_where}
+                ORDER BY h.BILLNO DESC, h.BILLTIME DESC
+            """,
+            f"""
+                SELECT h.BILLNO, h.BILLDATE, h.BILLTIME, h.COUNTERCODE, h.LOCATIONCODE,
+                       NVL(h.NETBILLAMOUNT, 0), 0, NULL
+                FROM TBLCANCELEDHDR h
+                WHERE {base_where}
+                ORDER BY h.BILLNO DESC, h.BILLTIME DESC
+            """,
+        ]
+        last_err = None
+        for sql in sql_attempts:
+            try:
+                rows, _cols = _fetch_rows(sql)
+                for row in rows:
+                    bno = _to_int(row[0], None)
+                    bdt = row[1]
+                    if hasattr(bdt, 'isoformat'):
+                        bdt_s = bdt.isoformat()
+                    elif bdt is not None:
+                        bdt_s = str(bdt)
+                    else:
+                        bdt_s = None
+                    bt_raw = row[2]
+                    bill_time_s = (str(bt_raw).strip() if bt_raw is not None else '') or ''
+                    cust_code = (str(row[7]).strip() if len(row) > 7 and row[7] is not None else '') or ''
+                    cust_name = ''
+                    if cust_code:
+                        cust_name = _customer_name_for_customercode(cur, cust_code) or ''
+                    rows_out.append({
+                        "billNo": bno,
+                        "billDate": bdt_s,
+                        "billTime": bill_time_s,
+                        "counterCode": (str(row[3]).strip() if row[3] is not None else '') or '',
+                        "locationCode": (str(row[4]).strip() if row[4] is not None else '') or '',
+                        "netBillAmount": _to_float(row[5], 0.0) if len(row) > 5 else 0.0,
+                        "discountAmount": _to_float(row[6], 0.0) if len(row) > 6 else 0.0,
+                        "customerCode": cust_code,
+                        "customerName": cust_name,
+                    })
+                last_err = None
+                break
+            except oracledb.Error as e:
+                err_up = str(e).upper()
+                last_err = e
+                if 'ORA-00904' in err_up or '00904' in err_up:
+                    continue
+                raise
+        if last_err is not None and not rows_out:
+            print(f"[Bills] suspended-by-date error: {last_err}")
+            return jsonify({"ok": False, "error": str(last_err)}), 500
+        return jsonify({"ok": True, "date": date_str, "bills": rows_out})
+    except oracledb.Error as e:
+        print(f"[Bills] suspended-by-date error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+    finally:
+        if cur:
+            try:
+                cur.close()
+            except Exception:
+                pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.route('/api/bills/suspended/<int:bill_no>/details', methods=['GET'])
+def suspended_bill_details(bill_no):
+    """Full suspended bill: TBLCANCELEDHDR (BILLSTATUS='C') + TBLCANCELEDDTL + item names from itemmaster."""
+    date_str = (request.args.get('date') or '').strip()
+    location_code = (request.args.get('locationCode') or request.args.get('location_code') or '').strip()
+    counter_code = (request.args.get('counterCode') or request.args.get('counter_code') or '').strip()
+    if not date_str:
+        return jsonify({"ok": False, "error": "date required (YYYY-MM-DD)"}), 400
+    conn = _get_connection()
+    if not conn:
+        return jsonify({"ok": False, "error": "Database unavailable"}), 503
+    cur = None
+    try:
+        cur = conn.cursor()
+        base_where = (
+            "h.BILLNO = :billno AND TRIM(TO_CHAR(TRUNC(h.BILLDATE), 'YYYY-MM-DD')) = :d "
+            "AND h.BILLSTATUS = 'C'"
+        )
+        hdr_bind = {"billno": bill_no, "d": date_str}
+        if location_code:
+            base_where += " AND NVL(TRIM(h.LOCATIONCODE), ' ') = NVL(TRIM(:loccode), ' ') "
+            hdr_bind["loccode"] = location_code
+        if counter_code:
+            base_where += " AND NVL(TRIM(h.COUNTERCODE), ' ') = NVL(TRIM(:cntcode), ' ') "
+            hdr_bind["cntcode"] = counter_code
+
+        hdr_sql_attempts = [
+            f"""
+                SELECT * FROM (
+                    SELECT h.BILLNO, h.BILLDATE, h.BILLTIME, h.COUNTERCODE, h.LOCATIONCODE,
+                           NVL(h.NETBILLAMOUNT, 0), NVL(h.DISCOUNTAMOUNT, 0), TRIM(h.CUSTOMERCODE),
+                           TRIM(h.BILLTYPE), TRIM(h.CARDTYPE), TRIM(h.CARDNO), NVL(h.PREVPOINTS, 0)
+                    FROM TBLCANCELEDHDR h
+                    WHERE {base_where}
+                    ORDER BY h.BILLTIME DESC NULLS LAST, h.BILLNO DESC
+                ) WHERE ROWNUM = 1
+            """,
+            f"""
+                SELECT * FROM (
+                    SELECT h.BILLNO, h.BILLDATE, h.BILLTIME, h.COUNTERCODE, h.LOCATIONCODE,
+                           NVL(h.NETBILLAMOUNT, 0), NVL(h.DISCOUNTAMOUNT, 0), CAST(NULL AS VARCHAR2(1)),
+                           TRIM(h.BILLTYPE), TRIM(h.CARDTYPE), TRIM(h.CARDNO), NVL(h.PREVPOINTS, 0)
+                    FROM TBLCANCELEDHDR h
+                    WHERE {base_where}
+                    ORDER BY h.BILLTIME DESC NULLS LAST, h.BILLNO DESC
+                ) WHERE ROWNUM = 1
+            """,
+            f"""
+                SELECT * FROM (
+                    SELECT h.BILLNO, h.BILLDATE, h.BILLTIME, h.COUNTERCODE, h.LOCATIONCODE,
+                           NVL(h.NETBILLAMOUNT, 0), 0, CAST(NULL AS VARCHAR2(1)),
+                           TRIM(h.BILLTYPE), TRIM(h.CARDTYPE), TRIM(h.CARDNO), 0
+                    FROM TBLCANCELEDHDR h
+                    WHERE {base_where}
+                    ORDER BY h.BILLTIME DESC NULLS LAST, h.BILLNO DESC
+                ) WHERE ROWNUM = 1
+            """,
+            f"""
+                SELECT * FROM (
+                    SELECT h.BILLNO, h.BILLDATE, h.BILLTIME, h.COUNTERCODE, h.LOCATIONCODE,
+                           NVL(h.NETBILLAMOUNT, 0), 0, CAST(NULL AS VARCHAR2(1)),
+                           'C', CAST(NULL AS VARCHAR2(1)), CAST(NULL AS VARCHAR2(1)), 0
+                    FROM TBLCANCELEDHDR h
+                    WHERE {base_where}
+                    ORDER BY h.BILLTIME DESC NULLS LAST, h.BILLNO DESC
+                ) WHERE ROWNUM = 1
+            """,
+        ]
+        hrow = None
+        last_hdr_err = None
+        for sql in hdr_sql_attempts:
+            try:
+                cur.execute(sql, hdr_bind)
+                hrow = cur.fetchone()
+                last_hdr_err = None
+                if hrow:
+                    break
+            except oracledb.Error as e:
+                err_up = str(e).upper()
+                last_hdr_err = e
+                if 'ORA-00904' in err_up or '00904' in err_up:
+                    continue
+                raise
+        if not hrow:
+            if last_hdr_err:
+                return jsonify({"ok": False, "error": str(last_hdr_err)}), 500
+            return jsonify({"ok": False, "error": "Suspended bill not found for this date"}), 404
+
+        loc_hdr = (str(hrow[4]).strip() if hrow[4] is not None else '') or ''
+        bdt = hrow[1]
+        if hasattr(bdt, 'isoformat'):
+            bill_date_iso = bdt.isoformat()
+        elif bdt is not None:
+            bill_date_iso = str(bdt)
+        else:
+            bill_date_iso = None
+        bill_time_s = (str(hrow[2]).strip() if hrow[2] is not None else '') or ''
+        cust_code = (str(hrow[7]).strip() if len(hrow) > 7 and hrow[7] is not None else '') or ''
+        cust_name = _customer_name_for_customercode(cur, cust_code) if cust_code else ''
+        hdr_out = {
+            "billNo": _to_int(hrow[0], bill_no),
+            "billDate": bill_date_iso,
+            "billTime": bill_time_s,
+            "counterCode": (str(hrow[3]).strip() if hrow[3] is not None else '') or '',
+            "locationCode": loc_hdr,
+            "netBillAmount": _to_float(hrow[5], 0.0) if len(hrow) > 5 else 0.0,
+            "discountAmount": _to_float(hrow[6], 0.0) if len(hrow) > 6 else 0.0,
+            "customerCode": cust_code,
+            "customerName": cust_name or '',
+            "billType": (str(hrow[8]).strip() if len(hrow) > 8 and hrow[8] is not None else '') or '',
+            "cardType": (str(hrow[9]).strip() if len(hrow) > 9 and hrow[9] is not None else '') or '',
+            "cardNo": (str(hrow[10]).strip() if len(hrow) > 10 and hrow[10] is not None else '') or '',
+            "prevPoints": _to_float(hrow[11], 0.0) if len(hrow) > 11 else 0.0,
+        }
+
+        loc_wh = ""
+        if loc_hdr:
+            loc_wh = " AND NVL(TRIM(LOCATIONCODE), ' ') = NVL(TRIM(:loc), ' ') "
+        dtl_sql_pairs = []
+        if loc_hdr:
+            dtl_sql_pairs.append(
+                (
+                    f"""
+                SELECT SLNO, ITEMCODE, QUANTITY, RATE, MANUFACTURERID, UNITOFMEASUREMENT,
+                       NVL(COSTPRICE, 0), NVL(PREVPOINTS, 0)
+                FROM TBLCANCELEDDTL
+                WHERE BILLNO = :bn {loc_wh}
+                ORDER BY SLNO
+                    """,
+                    {"bn": bill_no, "loc": loc_hdr},
+                )
+            )
+        dtl_sql_pairs.extend(
+            [
+                (
+                    """
+                SELECT SLNO, ITEMCODE, QUANTITY, RATE, MANUFACTURERID, UNITOFMEASUREMENT,
+                       NVL(COSTPRICE, 0), NVL(PREVPOINTS, 0)
+                FROM TBLCANCELEDDTL
+                WHERE BILLNO = :bn
+                ORDER BY SLNO
+                    """,
+                    {"bn": bill_no},
+                ),
+            ],
+        )
+        if loc_hdr:
+            dtl_sql_pairs.append(
+                (
+                    f"""
+                SELECT SLNO, ITEMCODE, QUANTITY, RATE, MANUFACTURERID, CAST(NULL AS VARCHAR2(1)), 0, 0
+                FROM TBLCANCELEDDTL
+                WHERE BILLNO = :bn {loc_wh}
+                ORDER BY SLNO
+                    """,
+                    {"bn": bill_no, "loc": loc_hdr},
+                )
+            )
+        dtl_sql_pairs.append(
+            (
+                """
+                SELECT SLNO, ITEMCODE, QUANTITY, RATE, MANUFACTURERID, CAST(NULL AS VARCHAR2(1)), 0, 0
+                FROM TBLCANCELEDDTL
+                WHERE BILLNO = :bn
+                ORDER BY SLNO
+                """,
+                {"bn": bill_no},
+            )
+        )
+        dtl_sql_pairs.append(
+            (
+                """
+                SELECT SLNO, ITEMCODE, QUANTITY, RATE, MANUFACTURERID
+                FROM TBLCANCELEDDTL
+                WHERE BILLNO = :bn
+                ORDER BY SLNO
+                """,
+                {"bn": bill_no},
+            )
+        )
+        items = []
+        last_dtl_err = None
+        for sql, bind in dtl_sql_pairs:
+            try:
+                cur.execute(sql, bind)
+                drows = cur.fetchall() or []
+                cols = [c[0].upper() if c else '' for c in cur.description] if cur.description else []
+
+                def _col(row, name, default=None):
+                    try:
+                        i = cols.index(name)
+                        return row[i] if i >= 0 and i < len(row) else default
+                    except (ValueError, IndexError):
+                        return default
+
+                for row in drows:
+                    slno = _to_int(_col(row, 'SLNO'), 0)
+                    itemcode = _col(row, 'ITEMCODE')
+                    code_str = str(itemcode).strip() if itemcode is not None else ''
+                    qty = _to_float(_col(row, 'QUANTITY'), 0.0)
+                    rate = _to_float(_col(row, 'RATE'), 0.0)
+                    mfg = _col(row, 'MANUFACTURERID')
+                    uom = _col(row, 'UNITOFMEASUREMENT')
+                    costp = _to_float(_col(row, 'COSTPRICE'), 0.0)
+                    ppts = _to_float(_col(row, 'PREVPOINTS'), 0.0)
+                    items.append({
+                        "slNo": slno,
+                        "itemCode": code_str,
+                        "itemName": "",
+                        "quantity": qty,
+                        "rate": rate,
+                        "lineAmount": round(qty * rate, 4),
+                        "manufacturerId": str(mfg).strip() if mfg is not None else '',
+                        "uom": str(uom).strip() if uom is not None else '',
+                        "costPrice": costp,
+                        "prevPoints": ppts,
+                    })
+                last_dtl_err = None
+                break
+            except oracledb.Error as e:
+                err_up = str(e).upper()
+                last_dtl_err = e
+                if 'ORA-00904' in err_up or '00904' in err_up:
+                    continue
+                raise
+        if last_dtl_err and not items:
+            return jsonify({"ok": False, "error": str(last_dtl_err)}), 500
+
+        codes = [it["itemCode"] for it in items if it.get("itemCode")]
+        names_map = _get_item_names_from_master(cur, codes)
+        for it in items:
+            c = it.get("itemCode") or ""
+            it["itemName"] = names_map.get(c, "") or ""
+
+        return jsonify({"ok": True, "header": hdr_out, "items": items})
+    except oracledb.Error as e:
+        print(f"[Bills] suspended details error: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
     finally:
         if cur:
@@ -4634,8 +6343,7 @@ def bill_receipt_reprint(bill_no):
                 "manufactureId": icode,
             })
 
-        _bt_up = str(bill_type).strip().upper()
-        is_ret = _bt_up == "X" or (_bt_up in ("C", "R", "1", "2") and net_amt < 0)
+        is_ret = _bill_hdr_is_sales_return(bill_type, net_amt)
         ca = float(card_amt)
         net = float(net_amt)
         if ca <= 0.001:
@@ -5168,9 +6876,68 @@ def _employee_code_from_request():
     return (payload.get('userid') or payload.get('sub') or '').strip() or None
 
 
+def _cashier_info_from_request(data=None):
+    """Return cashier user ID only."""
+    data = data or {}
+    
+    # Try reading from JSON body first
+    userid = (data.get('userId') or data.get('userid') or data.get('USERID') or data.get('employeeCode') or data.get('employeecode') or data.get('EMPLOYEECODE') or '').strip()
+    
+    # If not in JSON body, try reading from request JWT token
+    if not userid:
+        userid = (_employee_code_from_request() or '').strip()
+        
+    return userid or 'POS'
+
+
+def _display_user_for_employeecode(cur, employee_code):
+    """Resolve bill header EMPLOYEECODE to APPLICATIONUSER userid (login username is employeecode)."""
+    ec = (employee_code or '').strip()
+    if not ec:
+        return None
+    try:
+        cur.execute(
+            """
+            SELECT TRIM(NVL(USERID, '')), TRIM(NVL(EMPLOYEECODE, ''))
+            FROM APPLICATIONUSER
+            WHERE (UPPER(TRIM(EMPLOYEECODE)) = UPPER(:ec) OR UPPER(TRIM(USERID)) = UPPER(:ec))
+            AND ROWNUM = 1
+            """,
+            {"ec": ec},
+        )
+        row = cur.fetchone()
+        if not row:
+            return ec
+        uid = str(row[0]).strip() if row[0] is not None else ''
+        emp = str(row[1]).strip() if row[1] is not None else ''
+        if uid:
+            return uid
+        if emp:
+            return emp
+        return ec
+    except oracledb.Error:
+        return ec
+
+
+def _counter_operations_actor_name(cur, data):
+    """Value for OPENEDBY/CLOSEDBY: JWT userid when present; else APPLICATIONUSER.USERID from employee code (JWT sub)."""
+    pl = _decode_token(request.headers.get('Authorization') or '') or {}
+    jwt_userid = (pl.get('userid') or '').strip()
+    jwt_sub = (pl.get('sub') or pl.get('username') or '').strip()
+    fallback = (data.get('username') or '').strip()
+    emp_login = jwt_sub or fallback
+    if jwt_userid:
+        return jwt_userid
+    if not emp_login:
+        return None
+    if cur:
+        return _display_user_for_employeecode(cur, emp_login) or emp_login
+    return emp_login
+
+
 @app.route('/api/counter-operations/open', methods=['POST'])
 def counter_operations_open():
-    """Insert COUNTEROPERATIONS: DATEOFOPEN=selected date, OPENEDDATE=today, OPENFLAG='O', OPENEDBY=username, LOCATIONCODE from login."""
+    """Insert COUNTEROPERATIONS: DATEOFOPEN=selected date, OPENEDDATE=today, OPENFLAG='O', OPENEDBY=userid or resolved name, LOCATIONCODE from login."""
     data = request.get_json(silent=True) or {}
     date_str = (data.get('date') or data.get('dateOfOpen') or '').strip()
     counter_code = (data.get('counterCode') or data.get('counter_code') or '').strip() or '1'
@@ -5179,7 +6946,6 @@ def counter_operations_open():
         base_loc = _get_base_location()
         location_code = (base_loc or {}).get('locationCode') or (base_loc or {}).get('location_code') or '1'
     location_code = location_code or '1'
-    username = _username_from_request() or (data.get('username') or '').strip()
     if not date_str:
         return jsonify({"ok": False, "error": "date required"}), 400
     conn = _get_connection()
@@ -5207,13 +6973,14 @@ def counter_operations_open():
                 return jsonify({"ok": False, "error": "Counter already open for this date."}), 400
         from datetime import date as date_type
         today_str = date_type.today().strftime('%Y-%m-%d')
+        opened_by = _counter_operations_actor_name(cur, data)
         cur.execute(
             f"""
             INSERT INTO {COUNTEROPERATIONS_TABLE_NAME}
             (DATEOFOPEN, OPENEDDATE, OPENFLAG, OPENEDBY, COUNTERCODE, LOCATIONCODE, CASHIERCODE, POSFLAG)
             VALUES (TO_DATE(:d, 'YYYY-MM-DD'), TO_DATE(:oday, 'YYYY-MM-DD'), 'O', :openedby, :cntcode, :loccode, 0, 'C')
             """,
-            {"d": date_str, "oday": today_str, "openedby": username or None, "cntcode": counter_code or None, "loccode": location_code}
+            {"d": date_str, "oday": today_str, "openedby": opened_by or None, "cntcode": counter_code or None, "loccode": location_code}
         )
         conn.commit()
         return jsonify({"ok": True})
@@ -5237,13 +7004,59 @@ def counter_operations_open():
             pass
 
 
+def _count_held_bills_blocking_close(cur, location_code, date_str):
+    """Held bills (TEMPBILLHDR FLAG=0) for this location and business day block counter close."""
+    loc_num = _location_to_num(location_code, 1)
+    loc_str = (location_code or '').strip() or 'LOC001'
+    count = 0
+    try:
+        _ensure_tempbillhdr(cur)
+        sql_with_date = f"""
+            SELECT COUNT(DISTINCT BILLNO)
+            FROM {HOLD_TABLE_NAME}
+            WHERE LOCATIONCODE = :loc AND (FLAG = :flag OR FLAG IS NULL)
+            AND (
+                BILLDATE IS NULL
+                OR TRIM(TO_CHAR(TRUNC(BILLDATE), 'YYYY-MM-DD')) = :d
+            )
+        """
+        cur.execute(sql_with_date, loc=loc_num, flag=FLAG_HELD, d=date_str)
+        row = cur.fetchone()
+        count = int(_to_int(row[0], 0) if row else 0)
+    except oracledb.Error as e:
+        err_up = str(e).upper()
+        if 'ORA-00904' in err_up or '00904' in err_up:
+            try:
+                cur.execute(
+                    f"""
+                    SELECT COUNT(DISTINCT BILLNO)
+                    FROM {HOLD_TABLE_NAME}
+                    WHERE LOCATIONCODE = :loc AND (FLAG = :flag OR FLAG IS NULL)
+                    """,
+                    loc=loc_num,
+                    flag=FLAG_HELD,
+                )
+                row = cur.fetchone()
+                count = int(_to_int(row[0], 0) if row else 0)
+            except oracledb.Error:
+                count = 0
+        else:
+            raise
+    for (loc, _bill_no), v in _held_bills_fallback.items():
+        if loc == loc_str and not v.get("retrieved"):
+            hd = v.get("heldDate")
+            if not hd or str(hd)[:10] == str(date_str).strip()[:10]:
+                count += 1
+    return count
+
+
 @app.route('/api/counter-operations/close', methods=['POST'])
 def counter_operations_close():
-    """Update COUNTEROPERATIONS: set OPENFLAG='C', CLOSEDBY=username, CLOSEDDATE=sysdate for matching DATEOFOPEN and OPENFLAG='O'."""
+    """Update COUNTEROPERATIONS: set OPENFLAG='C', CLOSEDBY=userid or resolved name, CLOSEDDATE=sysdate for matching DATEOFOPEN and OPENFLAG='O'."""
     data = request.get_json(silent=True) or {}
     date_str = (data.get('date') or data.get('dateOfOpen') or '').strip()
     counter_code = (data.get('counterCode') or data.get('counter_code') or '').strip() or '1'
-    username = _username_from_request() or (data.get('username') or '').strip()
+    location_code = (data.get('locationCode') or data.get('location_code') or '').strip()
     if not date_str:
         return jsonify({"ok": False, "error": "date required"}), 400
     conn = _get_connection()
@@ -5252,7 +7065,18 @@ def counter_operations_close():
     cur = None
     try:
         cur = conn.cursor()
+        held_count = _count_held_bills_blocking_close(cur, location_code, date_str)
+        if held_count > 0:
+            msg = (
+                "Cannot close counter: 1 hold bill is still open. "
+                "Retrieve and complete or clear it first."
+                if held_count == 1
+                else f"Cannot close counter: {held_count} hold bills are still open. "
+                "Retrieve and complete or clear them first."
+            )
+            return jsonify({"ok": False, "error": msg, "holdBillCount": held_count}), 400
         _ensure_counter_operations_table(cur)
+        closed_by = _counter_operations_actor_name(cur, data)
         cur.execute(
             f"""
             UPDATE {COUNTEROPERATIONS_TABLE_NAME}
@@ -5260,7 +7084,7 @@ def counter_operations_close():
             WHERE TRIM(TO_CHAR(DATEOFOPEN, 'YYYY-MM-DD')) = :d AND OPENFLAG = 'O'
             AND NVL(TRIM(COUNTERCODE), ' ') = NVL(TRIM(:cntcode), ' ')
             """,
-            {"closedby": username or None, "d": date_str, "cntcode": counter_code or ''}
+            {"closedby": closed_by or None, "d": date_str, "cntcode": counter_code or ''}
         )
         conn.commit()
         return jsonify({"ok": True, "updated": cur.rowcount})
@@ -5287,7 +7111,7 @@ def counter_operations_close():
 @app.route('/api/counter-operations/daily-summary', methods=['GET'])
 def counter_operations_daily_summary():
     """Sum paid bills from BILLHDRHISTORY for a calendar day (BILLDATE).
-    BILLTYPE: C/R = cash/credit sales; X = sales return. Legacy: negative NET on C/R treated as return."""
+    BILLTYPE: C = cash, R = credit (sale and return). Return = negative NETBILLAMOUNT on C or R."""
     date_str = (request.args.get('date') or request.args.get('dateOfOpen') or '').strip()
     counter_code = (request.args.get('counterCode') or request.args.get('counter_code') or '').strip()
     location_code = (request.args.get('locationCode') or request.args.get('location_code') or '').strip()
@@ -5313,17 +7137,15 @@ def counter_operations_daily_summary():
         sql = f"""
             SELECT
               NVL(SUM(CASE
-                WHEN TRIM(BILLTYPE) IN ('C', '1', 'R', '2') AND NVL(NETBILLAMOUNT, 0) > 0
+                WHEN {_SQL_BILL_IS_SALE}
                 THEN NVL(NETBILLAMOUNT, 0) ELSE 0 END), 0),
               NVL(SUM(CASE
-                WHEN TRIM(BILLTYPE) = 'X' THEN ABS(NVL(NETBILLAMOUNT, 0))
-                WHEN TRIM(BILLTYPE) IN ('C', '1', 'R', '2') AND NVL(NETBILLAMOUNT, 0) < 0
+                WHEN {_SQL_BILL_IS_RETURN}
                 THEN ABS(NVL(NETBILLAMOUNT, 0)) ELSE 0 END), 0),
               NVL(SUM(CASE
-                WHEN TRIM(BILLTYPE) IN ('C', '1', 'R', '2') AND NVL(NETBILLAMOUNT, 0) > 0 THEN 1 ELSE 0 END), 0),
+                WHEN {_SQL_BILL_IS_SALE} THEN 1 ELSE 0 END), 0),
               NVL(SUM(CASE
-                WHEN TRIM(BILLTYPE) = 'X' THEN 1
-                WHEN TRIM(BILLTYPE) IN ('C', '1', 'R', '2') AND NVL(NETBILLAMOUNT, 0) < 0 THEN 1 ELSE 0 END), 0)
+                WHEN {_SQL_BILL_IS_RETURN} THEN 1 ELSE 0 END), 0)
             FROM {BILLHDRHISTORY_TABLE_NAME}
             WHERE {base_where}
         """
@@ -5334,9 +7156,8 @@ def counter_operations_daily_summary():
             if 'ORA-00904' in err_up or '00904' in err_up:
                 sql_fallback = f"""
                     SELECT
-                      NVL(SUM(CASE
-                        WHEN TRIM(BILLTYPE) IN ('C', '1', 'R', '2') THEN 1 ELSE 0 END), 0),
-                      NVL(SUM(CASE WHEN TRIM(BILLTYPE) = 'X' THEN 1 ELSE 0 END), 0)
+                      NVL(SUM(CASE WHEN {_SQL_BILL_IS_SALE} THEN 1 ELSE 0 END), 0),
+                      NVL(SUM(CASE WHEN {_SQL_BILL_IS_RETURN} THEN 1 ELSE 0 END), 0)
                     FROM {BILLHDRHISTORY_TABLE_NAME}
                     WHERE {base_where}
                 """
@@ -5359,8 +7180,12 @@ def counter_operations_daily_summary():
                     "cardByType": {},
                     "discountTotal": 0.0,
                     "creditTotal": 0.0,
+                    "creditReturnTotal": 0.0,
+                    "crReconciled": 0.0,
                     "voucherTotal": 0.0,
+                    "onlineTotal": 0.0,
                     "cashInBox": 0.0,
+                    "loggedCashier": None,
                     "note": "NETBILLAMOUNT column unavailable; amounts are zero.",
                 })
             raise
@@ -5390,8 +7215,7 @@ def counter_operations_daily_summary():
                 SELECT NVL(TRIM(CARDTYPE), 'CARD'), NVL(SUM(NVL(CARDAMOUNT, 0)), 0)
                 FROM {BILLHDRHISTORY_TABLE_NAME}
                 WHERE {base_where}
-                AND TRIM(BILLTYPE) IN ('C', '1', 'R', '2')
-                AND NVL(NETBILLAMOUNT, 0) > 0
+                AND {_SQL_BILL_IS_SALE}
                 GROUP BY NVL(TRIM(CARDTYPE), 'CARD')
             """
             cur.execute(sql_card, bind)
@@ -5411,10 +7235,7 @@ def counter_operations_daily_summary():
                 SELECT NVL(SUM(NVL(CARDAMOUNT, 0)), 0)
                 FROM {BILLHDRHISTORY_TABLE_NAME}
                 WHERE {base_where}
-                AND (
-                    TRIM(BILLTYPE) = 'X'
-                    OR (TRIM(BILLTYPE) IN ('C', '1', 'R', '2') AND NVL(NETBILLAMOUNT, 0) < 0)
-                )
+                AND {_SQL_BILL_IS_RETURN}
             """
             cur.execute(sql_card_ret, bind)
             rr = cur.fetchone()
@@ -5456,6 +7277,7 @@ def counter_operations_daily_summary():
                   ON cs.BILLNO = h.BILLNO
                  AND NVL(TRIM(cs.LOCATIONCODE), ' ') = NVL(TRIM(h.LOCATIONCODE), ' ')
                 WHERE {base_where_h}
+                  AND {_SQL_BILL_IS_SALE_H}
             """
             cur.execute(sql_cred, bind)
             cr = cur.fetchone()
@@ -5463,6 +7285,40 @@ def counter_operations_daily_summary():
         except oracledb.Error as cred_err:
             print(f"[CounterOperations] daily-summary credit (TBLCREDITSETTLEMENT): {cred_err}")
             credit_total = 0.0
+        # Credit customer returns (TBLCREDITSETTLEMENT on R bills with negative net) — counter close "Cr.Reconcilled"
+        credit_return_total = 0.0
+        try:
+            sql_cred_ret = f"""
+                SELECT NVL(SUM(NVL(cs.BILLAMOUNT, 0)), 0)
+                FROM TBLCREDITSETTLEMENT cs
+                INNER JOIN {BILLHDRHISTORY_TABLE_NAME} h
+                  ON cs.BILLNO = h.BILLNO
+                 AND NVL(TRIM(cs.LOCATIONCODE), ' ') = NVL(TRIM(h.LOCATIONCODE), ' ')
+                WHERE {base_where_h}
+                  AND {_SQL_BILL_IS_RETURN_H}
+            """
+            cur.execute(sql_cred_ret, bind)
+            crr = cur.fetchone()
+            credit_return_total = float(crr[0]) if crr and crr[0] is not None else 0.0
+        except oracledb.Error as cred_ret_err:
+            print(f"[CounterOperations] daily-summary credit returns (TBLCREDITSETTLEMENT): {cred_ret_err}")
+            credit_return_total = 0.0
+        # Online channel total (BILLHDRHISTORY.ADDRESS = sales channel description)
+        online_total = 0.0
+        try:
+            _ensure_billhdr_extended_columns(cur)
+            sql_online = f"""
+                SELECT NVL(SUM(NVL(NETBILLAMOUNT, 0)), 0)
+                FROM {BILLHDRHISTORY_TABLE_NAME}
+                WHERE {base_where}
+                  AND UPPER(TRIM(ADDRESS)) = 'ONLINE'
+            """
+            cur.execute(sql_online, bind)
+            orow = cur.fetchone()
+            online_total = float(orow[0]) if orow and orow[0] is not None else 0.0
+        except oracledb.Error as online_err:
+            print(f"[CounterOperations] daily-summary online (ADDRESS): {online_err}")
+            online_total = 0.0
         # Cash in drawer = sum per bill: sales +(NET-CARD), returns -(NET-CARD), then subtract credit & vouchers
         # (Credit bills were counted as cash in the raw sum because CARDAMOUNT=0; subtract credit_total.)
         cash_in_box = round(net_total - total_card + total_card_returns - credit_total - voucher_total, 3)
@@ -5471,10 +7327,9 @@ def counter_operations_daily_summary():
             sql_cash = f"""
                 SELECT NVL(SUM(
                     CASE
-                        WHEN TRIM(BILLTYPE) IN ('C', '1', 'R', '2') AND NVL(NETBILLAMOUNT, 0) > 0
+                        WHEN {_SQL_BILL_IS_SALE}
                         THEN NVL(NETBILLAMOUNT, 0) - NVL(CARDAMOUNT, 0)
-                        WHEN TRIM(BILLTYPE) = 'X'
-                        OR (TRIM(BILLTYPE) IN ('C', '1', 'R', '2') AND NVL(NETBILLAMOUNT, 0) < 0)
+                        WHEN {_SQL_BILL_IS_RETURN}
                         THEN -(ABS(NVL(NETBILLAMOUNT, 0)) - NVL(CARDAMOUNT, 0))
                         ELSE 0
                     END
@@ -5488,6 +7343,31 @@ def counter_operations_daily_summary():
                 cash_in_box = round(float(crow[0]) - float(credit_total) - float(voucher_total), 3)
         except oracledb.Error as cash_err:
             print(f"[CounterOperations] daily-summary cash-in-box (per-row): {cash_err}")
+        # Register operator for the day (who posted bills), not necessarily the user printing the close slip.
+        logged_cashier = None
+        try:
+            _ensure_billhdr_extended_columns(cur)
+            sql_logged_cashier = f"""
+                SELECT cashier_code FROM (
+                    SELECT NVL(TRIM(h.EMPLOYEECODE), '') AS cashier_code, COUNT(*) AS cnt
+                    FROM {BILLHDRHISTORY_TABLE_NAME} h
+                    WHERE {base_where_h}
+                      AND LENGTH(TRIM(NVL(h.EMPLOYEECODE, ' '))) > 0
+                      AND UPPER(TRIM(h.EMPLOYEECODE)) NOT IN ('POS')
+                    GROUP BY NVL(TRIM(h.EMPLOYEECODE), '')
+                    ORDER BY cnt DESC
+                ) WHERE ROWNUM = 1
+            """
+            cur.execute(sql_logged_cashier, bind)
+            lc_row = cur.fetchone()
+            if lc_row and lc_row[0] is not None:
+                _lc = str(lc_row[0]).strip()
+                logged_cashier = _lc if _lc else None
+        except oracledb.Error as lc_err:
+            print(f"[CounterOperations] daily-summary loggedCashier (optional): {lc_err}")
+            logged_cashier = None
+        if logged_cashier:
+            logged_cashier = _display_user_for_employeecode(cur, logged_cashier)
         return jsonify({
             "ok": True,
             "date": date_str,
@@ -5503,14 +7383,18 @@ def counter_operations_daily_summary():
             "cardByType": card_by_type,
             "discountTotal": round(discount_total, 3),
             "creditTotal": round(credit_total, 3),
+            "creditReturnTotal": round(credit_return_total, 3),
+            "crReconciled": round(credit_return_total, 3),
             "voucherTotal": round(voucher_total, 3),
+            "onlineTotal": round(online_total, 3),
             "cashInBox": cash_in_box,
+            "loggedCashier": logged_cashier,
             "calculationNote": (
-                "Totals from BILLHDRHISTORY: C/R = cash/credit sales, X = sales return; "
-                "legacy returns may show as negative NET on C/R. "
+                "Totals from BILLHDRHISTORY: BILLTYPE C = cash, R = credit; "
+                "returns = same type with negative NETBILLAMOUNT. "
                 "Cash in box = per-bill cash (sale: NET−CARD; return: −(ABS(NET)−CARD)) "
                 "minus credit-on-account and vouchers; credit from TBLCREDITSETTLEMENT; "
-                "discount from BILLDTLHISTORY.ITDISC."
+                "discount from BILLDTLHISTORY.ITDISC; online = sum NETBILLAMOUNT where ADDRESS is ONLINE."
             ),
         })
     except oracledb.Error as e:
@@ -5703,6 +7587,8 @@ def hold_bill():
                 billtime_str = now.strftime('%H:%M:%S')
                 set_ts = _hold_request_has_timestamp(data)
 
+                createdby_val = _cashier_info_from_request(data)
+
                 # One header row: update draft row to held; if no billTime/billDate in request, only FLAG changes
                 if set_ts:
                     try:
@@ -5713,23 +7599,36 @@ def hold_bill():
                                 BILLTIME = :billtime,
                                 COUNTERCODE = :countercode,
                                 CUSTOMERCODE = :customercode,
-                                RESETNO = 1
+                                RESETNO = 1,
+                                CREATEDBY = :createdby
                             WHERE BILLNO = :billno AND LOCATIONCODE = :loc AND (FLAG = {FLAG_DRAFT} OR FLAG IS NULL)
                         """, billno=bill_no, loc=loc_num, flag=FLAG_HELD, billdate=billdate_str,
-                             billtime=billtime_str, countercode=counter_code, customercode=customer_code)
+                             billtime=billtime_str, countercode=counter_code, customercode=customer_code, createdby=createdby_val)
                     except oracledb.Error as e:
-                        cur.execute(f"""
-                            UPDATE {HOLD_TABLE_NAME} SET FLAG = :flag
-                            WHERE BILLNO = :billno AND LOCATIONCODE = :loc AND (FLAG = {FLAG_DRAFT} OR FLAG IS NULL)
-                        """, billno=bill_no, loc=loc_num, flag=FLAG_HELD)
+                        try:
+                            cur.execute(f"""
+                                UPDATE {HOLD_TABLE_NAME} SET FLAG = :flag, CREATEDBY = :createdby
+                                WHERE BILLNO = :billno AND LOCATIONCODE = :loc AND (FLAG = {FLAG_DRAFT} OR FLAG IS NULL)
+                            """, billno=bill_no, loc=loc_num, flag=FLAG_HELD, createdby=createdby_val)
+                        except oracledb.Error:
+                            cur.execute(f"""
+                                UPDATE {HOLD_TABLE_NAME} SET FLAG = :flag
+                                WHERE BILLNO = :billno AND LOCATIONCODE = :loc AND (FLAG = {FLAG_DRAFT} OR FLAG IS NULL)
+                            """, billno=bill_no, loc=loc_num, flag=FLAG_HELD)
                 else:
                     try:
                         cur.execute(f"""
-                            UPDATE {HOLD_TABLE_NAME} SET FLAG = :flag
+                            UPDATE {HOLD_TABLE_NAME} SET FLAG = :flag, CREATEDBY = :createdby
                             WHERE BILLNO = :billno AND LOCATIONCODE = :loc AND (FLAG = {FLAG_DRAFT} OR FLAG IS NULL)
-                        """, billno=bill_no, loc=loc_num, flag=FLAG_HELD)
+                        """, billno=bill_no, loc=loc_num, flag=FLAG_HELD, createdby=createdby_val)
                     except oracledb.Error as e:
-                        print(f"[Hold] {HOLD_TABLE_NAME} FLAG-only update failed: {e}")
+                        try:
+                            cur.execute(f"""
+                                UPDATE {HOLD_TABLE_NAME} SET FLAG = :flag
+                                WHERE BILLNO = :billno AND LOCATIONCODE = :loc AND (FLAG = {FLAG_DRAFT} OR FLAG IS NULL)
+                            """, billno=bill_no, loc=loc_num, flag=FLAG_HELD)
+                        except oracledb.Error:
+                            print(f"[Hold] {HOLD_TABLE_NAME} FLAG-only update failed: {e}")
 
                 updated = cur.rowcount
                 if updated == 0:
@@ -5747,11 +7646,12 @@ def hold_bill():
                         'countercode': counter_code,
                         'resetno': 1,
                         'prevpoints': 0,
+                        'createdby': createdby_val,
                     }
                     try:
                         cur.execute(f"""
-                            INSERT INTO {HOLD_TABLE_NAME} (BILLNO, LOCATIONCODE, FLAG, BILLDATE, BILLTYPE, CARDTYPE, CARDNO, CUSTOMERCODE, BILLTIME, COUNTERCODE, RESETNO, PREVPOINTS)
-                            VALUES (:billno, :loc, :flag, TO_DATE(:billdate, 'YYYY-MM-DD'), :billtype, :cardtype, :cardno, :customercode, :billtime, :countercode, :resetno, :prevpoints)
+                            INSERT INTO {HOLD_TABLE_NAME} (BILLNO, LOCATIONCODE, FLAG, BILLDATE, BILLTYPE, CARDTYPE, CARDNO, CUSTOMERCODE, BILLTIME, COUNTERCODE, RESETNO, PREVPOINTS, CREATEDBY)
+                            VALUES (:billno, :loc, :flag, TO_DATE(:billdate, 'YYYY-MM-DD'), :billtype, :cardtype, :cardno, :customercode, :billtime, :countercode, :resetno, :prevpoints, :createdby)
                         """, hdr)
                     except oracledb.Error:
                         cur.execute(f"""
@@ -5759,8 +7659,12 @@ def hold_bill():
                             VALUES (:billno, :loc, :flag)
                         """, {'billno': hdr['billno'], 'loc': hdr['loc'], 'flag': hdr['flag']})
                 
-                # Sync TEMPBILLDTL when holding (ITEMFLAG=1 for held items)
-                _cart_sync_tempbilldtl(cur, conn, bill_no, location_code, items, item_flag=1)
+                # Sync TEMPBILLDTL when holding (ITEMFLAG=1). Skip full re-sync when cart was just synced.
+                cart_already_synced = data.get('cartAlreadySynced') in (True, 'true', '1', 1)
+                if cart_already_synced and _mark_tempbilldtl_itemflag(cur, bill_no, item_flag=1) > 0:
+                    _patch_tempbilldtl_from_cart_items(cur, bill_no, items)
+                else:
+                    _cart_sync_tempbilldtl(cur, conn, bill_no, location_code, items, item_flag=1)
                 try:
                     cur.execute(
                         f"UPDATE {BILLNO_TABLE_NAME} SET FLAG = :flag WHERE BILLNO = :billno",
@@ -5910,7 +7814,7 @@ def void_line():
 
 
 def _insert_itemjournal_and_itemlog(cur, bill_no, location_code, dtl_params, is_sales_return=False):
-    """Insert ITEMJOURNAL and ITEMLOG for finalized bill lines (payment time). ITEMLOG.QUANTITY is decimal (3dp); ITEMLOG.FACTOR is integer (rounded conv × qty)."""
+    """Insert ITEMJOURNAL and ITEMLOG for finalized bill lines (payment time). ITEMLOG.QUANTITY and FACTOR are decimal (3dp); FACTOR = conv × qty (e.g. 0.395 kg)."""
     if not dtl_params:
         return
     loc_num = _location_to_num(location_code, 1)
@@ -5974,24 +7878,11 @@ def _insert_itemjournal_and_itemlog(cur, bill_no, location_code, dtl_params, is_
                 else:
                     print(f"[ItemJournal] insert warning: {e}")
     _ensure_itemlog(cur)
-    try:
-        loc_str = str(location_code or '').strip()
-        cur.execute(
-            f"""
-            DELETE FROM {ITEMLOG_TABLE_NAME}
-            WHERE DOCUMENTNO = :doc
-              AND TRIM(TO_CHAR(LOCATIONCODE)) IN (TRIM(TO_CHAR(:loc_num)), :loc_str)
-            """,
-            doc=bill_no,
-            loc_num=loc_num,
-            loc_str=loc_str,
-        )
-    except oracledb.Error as e:
-        print(f"[ItemLog] delete for bill warning: {e}")
     transtype_log = 'SALE RETURN' if is_sales_return else 'SALE'
+    itemlog_createdby = _employee_code_from_request() or 'POS'
     itemlog_sql = f"""
-        INSERT INTO {ITEMLOG_TABLE_NAME} (LOGNO, ITEMCODE, CURRENTSTOCK, TRANSACTIONTYPE, QUANTITY, UOM, DOCUMENTNO, LOCATIONCODE, RATE, FACTOR, CREATEDDATE)
-        SELECT (SELECT NVL(MAX(L.LOGNO), 0) + 1 FROM {ITEMLOG_TABLE_NAME} L), :itemcode, 0, :transtype, :quantity, :uom, :documentno, :locationcode, :rate, :factor, SYSDATE
+        INSERT INTO {ITEMLOG_TABLE_NAME} (LOGNO, ITEMCODE, CURRENTSTOCK, TRANSACTIONTYPE, QUANTITY, UOM, DOCUMENTNO, LOCATIONCODE, RATE, FACTOR, CREATEDDATE, CREATEDBY)
+        SELECT (SELECT NVL(MAX(L.LOGNO), 0) + 1 FROM {ITEMLOG_TABLE_NAME} L), :itemcode, 0, :transtype, :quantity, :uom, :documentno, :locationcode, :rate, :factor, SYSDATE, :createdby
         FROM DUAL
     """
     for p in dtl_params:
@@ -6012,9 +7903,9 @@ def _insert_itemjournal_and_itemlog(cur, bill_no, location_code, dtl_params, is_
             conv_per_unit = 1.0
         qty_abs = abs(float(qline))
         try:
-            factor_col = int(round(conv_per_unit * qty_abs))
+            factor_col = _round_qty_for_db(conv_per_unit * qty_abs, 3)
         except (TypeError, ValueError, OverflowError):
-            factor_col = 0
+            factor_col = 0.0
         il_bind = {
             'itemcode': _itemcode_numeric_if_possible(p.get('itemcode')),
             'transtype': transtype_log,
@@ -6024,6 +7915,7 @@ def _insert_itemjournal_and_itemlog(cur, bill_no, location_code, dtl_params, is_
             'locationcode': loc_num,
             'rate': p.get('rate', 0.0),
             'factor': factor_col,
+            'createdby': itemlog_createdby,
         }
         try:
             cur.execute(itemlog_sql, il_bind)
@@ -6031,15 +7923,28 @@ def _insert_itemjournal_and_itemlog(cur, bill_no, location_code, dtl_params, is_
             err_str = str(e).upper()
             if '00904' in err_str or 'ORA-00904' in err_str:
                 itemlog_sql_no_factor = f"""
-                    INSERT INTO {ITEMLOG_TABLE_NAME} (LOGNO, ITEMCODE, CURRENTSTOCK, TRANSACTIONTYPE, QUANTITY, UOM, DOCUMENTNO, LOCATIONCODE, RATE, CREATEDDATE)
-                    SELECT (SELECT NVL(MAX(L.LOGNO), 0) + 1 FROM {ITEMLOG_TABLE_NAME} L), :itemcode, 0, :transtype, :quantity, :uom, :documentno, :locationcode, :rate, SYSDATE
+                    INSERT INTO {ITEMLOG_TABLE_NAME} (LOGNO, ITEMCODE, CURRENTSTOCK, TRANSACTIONTYPE, QUANTITY, UOM, DOCUMENTNO, LOCATIONCODE, RATE, CREATEDDATE, CREATEDBY)
+                    SELECT (SELECT NVL(MAX(L.LOGNO), 0) + 1 FROM {ITEMLOG_TABLE_NAME} L), :itemcode, 0, :transtype, :quantity, :uom, :documentno, :locationcode, :rate, SYSDATE, :createdby
                     FROM DUAL
                 """
                 try:
                     _il2 = {k: v for k, v in il_bind.items() if k != 'factor'}
                     cur.execute(itemlog_sql_no_factor, _il2)
                 except oracledb.Error as e2:
-                    print(f"[ItemLog] insert warning: {e2}")
+                    err2 = str(e2).upper()
+                    if '00904' in err2 or 'ORA-00904' in err2:
+                        itemlog_sql_legacy = f"""
+                            INSERT INTO {ITEMLOG_TABLE_NAME} (LOGNO, ITEMCODE, CURRENTSTOCK, TRANSACTIONTYPE, QUANTITY, UOM, DOCUMENTNO, LOCATIONCODE, RATE, CREATEDDATE)
+                            SELECT (SELECT NVL(MAX(L.LOGNO), 0) + 1 FROM {ITEMLOG_TABLE_NAME} L), :itemcode, 0, :transtype, :quantity, :uom, :documentno, :locationcode, :rate, SYSDATE
+                            FROM DUAL
+                        """
+                        try:
+                            _il3 = {k: v for k, v in il_bind.items() if k not in ('factor', 'createdby')}
+                            cur.execute(itemlog_sql_legacy, _il3)
+                        except oracledb.Error as e3:
+                            print(f"[ItemLog] insert warning: {e3}")
+                    else:
+                        print(f"[ItemLog] insert warning: {e2}")
             else:
                 print(f"[ItemLog] insert warning: {e}")
 
@@ -6135,6 +8040,7 @@ def _cart_sync_tempbillhdr(cur, conn, bill_no, location_code, items, extra_data=
                     billno=bill_no, loc=loc_num)
     if items:
         # One TEMPBILLHDR row per bill (not per cart line or quantity)
+        createdby_val = _cashier_info_from_request(extra_data)
         hdr_one = {
             'billno': bill_no,
             'loc': loc_num,
@@ -6148,11 +8054,12 @@ def _cart_sync_tempbillhdr(cur, conn, bill_no, location_code, items, extra_data=
             'countercode': countercode,
             'resetno': 1,
             'prevpoints': prevpoints,
+            'createdby': createdby_val,
         }
         try:
             cur.execute(f"""
-                INSERT INTO {HOLD_TABLE_NAME} (BILLNO, LOCATIONCODE, FLAG, BILLDATE, BILLTYPE, CARDTYPE, CARDNO, CUSTOMERCODE, BILLTIME, COUNTERCODE, RESETNO, PREVPOINTS)
-                VALUES (:billno, :loc, :flag, TO_DATE(:billdate, 'YYYY-MM-DD'), :billtype, :cardtype, :cardno, :customercode, :billtime, :countercode, :resetno, :prevpoints)
+                INSERT INTO {HOLD_TABLE_NAME} (BILLNO, LOCATIONCODE, FLAG, BILLDATE, BILLTYPE, CARDTYPE, CARDNO, CUSTOMERCODE, BILLTIME, COUNTERCODE, RESETNO, PREVPOINTS, CREATEDBY)
+                VALUES (:billno, :loc, :flag, TO_DATE(:billdate, 'YYYY-MM-DD'), :billtype, :cardtype, :cardno, :customercode, :billtime, :countercode, :resetno, :prevpoints, :createdby)
             """, hdr_one)
         except oracledb.Error as e:
             err_str = str(e).upper()
@@ -6167,93 +8074,169 @@ def _cart_sync_tempbillhdr(cur, conn, bill_no, location_code, items, extra_data=
             """, {'billno': hdr_one['billno'], 'loc': hdr_one['loc']})
 
 
-def _cart_sync_tempbilldtl(cur, conn, bill_no, location_code, items, item_flag=None):
-    """Sync TEMPBILLDTL (detail) with ITEMFLAG when items added to cart.
+def _tempbilldtl_summary_by_bills(cur, bill_nos):
+    """Batch line count and estimated total per BILLNO from TEMPBILLDTL (for held-bill list)."""
+    if not bill_nos:
+        return {}
+    ids = []
+    for b in bill_nos:
+        try:
+            n = int(b)
+            if n >= 1:
+                ids.append(n)
+        except (TypeError, ValueError):
+            continue
+    if not ids:
+        return {}
+    out = {}
+    chunk_size = 500
+    for i in range(0, len(ids), chunk_size):
+        chunk = ids[i:i + chunk_size]
+        binds = {f'b{j}': bn for j, bn in enumerate(chunk)}
+        in_list = ','.join(f':b{j}' for j in range(len(chunk)))
+        try:
+            cur.execute(f"""
+                SELECT BILLNO, COUNT(*), NVL(SUM(NVL(QUANTITY, 0) * NVL(RATE, 0)), 0)
+                FROM {HOLD_DTL_TABLE_NAME}
+                WHERE BILLNO IN ({in_list})
+                GROUP BY BILLNO
+            """, binds)
+            for row in cur.fetchall():
+                if row and row[0] is not None:
+                    out[int(row[0])] = {
+                        'lineCount': int(row[1] or 0),
+                        'estimatedTotal': float(row[2] or 0),
+                    }
+        except oracledb.Error as e:
+            print(f"[Hold] TEMPBILLDTL summary error: {e}")
+    return out
 
-    Args:
-        item_flag: If provided, uses this value for ITEMFLAG column (for hold operations)
-    """
+
+def _mark_tempbilldtl_itemflag(cur, bill_no, item_flag=1):
+    """Mark existing TEMPBILLDTL rows (cart already synced) — avoids DELETE+re-INSERT on hold."""
+    bill_no = _to_int(bill_no, 1)
+    try:
+        cur.execute(
+            f"UPDATE {HOLD_DTL_TABLE_NAME} SET ITEMFLAG = :flag WHERE BILLNO = :billno",
+            flag=item_flag, billno=bill_no,
+        )
+        return cur.rowcount or 0
+    except oracledb.Error as e:
+        if 'ORA-00904' not in str(e).upper() and '00904' not in str(e).upper():
+            print(f"[Hold] TEMPBILLDTL ITEMFLAG update: {e}")
+        return 0
+
+
+def _cart_sync_tempbilldtl(cur, conn, bill_no, location_code, items, item_flag=None):
+    """Incremental TEMPBILLDTL sync: upsert lines by (ITEMCODE, MANUFACTURERID), delete removed lines."""
     loc_num = _location_to_num(location_code, 1)
     bill_no = _to_int(bill_no, 1)
     _ensure_tempbilldtl(cur)
-    cur.execute(f"DELETE FROM {HOLD_DTL_TABLE_NAME} WHERE BILLNO = :billno", billno=bill_no)
-    dtl_params = []
-    for slno, it in enumerate(items or [], start=1):
-        if not isinstance(it, dict):
-            continue
-        itemcode = str(it.get('id') or it.get('itemcode') or it.get('ITEMCODE') or '').strip()
-        qty = _cart_quantity_from_item(it)
-        rate = _to_float(it.get('price') or it.get('PRICE') or it.get('rate'), 0.0)
-        manufacturer_id = str(it.get('manufactureId') or it.get('MANUFACTURERID') or it.get('manufacturerId') or '').strip()
-        uom_line = str(it.get('uom') or it.get('BASEUOM') or it.get('baseuom') or it.get('UNITOFMEASUREMENT') or '').strip()
-        prevpoints = _to_float(it.get('prevpoints') or it.get('PREVPOINTS') or it.get('points') or 0, 0)
-        costprice = _to_float(it.get('costprice') or it.get('COSTPRICE') or it.get('cost') or 0, 0)
-        retailprice = _to_float(it.get('retailprice') or it.get('RETAILPRICE') or it.get('retail') or rate, 0)
-        store = str(it.get('store') or it.get('STORE') or location_code or '').strip()
-        dtl_params.append({
-            'loc': location_code,
-            'billno': bill_no,
-            'slno': slno,
-            'itemcode': itemcode or None,
-            'quantity': qty,
-            'rate': rate,
-            'manufacturerid': manufacturer_id or None,
-            'uom': uom_line or None,
-            'void': bool(it.get('void')),
-            'unitofmeasurement': uom_line or None,
-            'resetno': 1,
-            'prevpoints': prevpoints,
-            'costprice': costprice,
-            'retailprice': retailprice,
-            'store': store or location_code,
-            'itemflag': item_flag if item_flag is not None else (1 if itemcode else 0),
-        })
-    if dtl_params:
-        # executemany bind dicts must match SQL only — extra keys (e.g. uom) cause ORA-01036 with thin driver.
-        dtl_bind = [
-            {
-                'loc': p['loc'],
-                'billno': p['billno'],
-                'slno': p['slno'],
-                'itemcode': p['itemcode'],
-                'quantity': p['quantity'],
-                'rate': p['rate'],
-                'manufacturerid': p['manufacturerid'],
-                'unitofmeasurement': p['unitofmeasurement'],
-                'resetno': p['resetno'],
-                'prevpoints': p['prevpoints'],
-                'costprice': p['costprice'],
-                'retailprice': p['retailprice'],
-                'store': p['store'],
-                'itemflag': p['itemflag'],
-            }
-            for p in dtl_params
-        ]
+    if not items:
         try:
-            cur.executemany(f"""
-                INSERT INTO {HOLD_DTL_TABLE_NAME} (LOCATIONCODE, BILLNO, SLNO, ITEMCODE, QUANTITY, RATE, MANUFACTURERID, UNITOFMEASUREMENT, RESETNO, PREVPOINTS, COSTPRICE, RETAILPRICE, STORE, ITEMFLAG)
-                VALUES (:loc, :billno, :slno, :itemcode, :quantity, :rate, :manufacturerid, :unitofmeasurement, :resetno, :prevpoints, :costprice, :retailprice, :store, :itemflag)
-            """, dtl_bind)
-        except oracledb.Error as e:
-            if 'ORA-00904' not in str(e).upper() and '00904' not in str(e).upper():
-                raise
-            # Fallback: insert without new columns for backward compatibility
-            dtl_bind_fallback = [
-                {
-                    'loc': p['loc'],
-                    'billno': p['billno'],
-                    'slno': p['slno'],
-                    'itemcode': p['itemcode'],
-                    'quantity': p['quantity'],
-                    'rate': p['rate'],
-                    'manufacturerid': p['manufacturerid'],
-                }
-                for p in dtl_params
-            ]
-            cur.executemany(f"""
-                INSERT INTO {HOLD_DTL_TABLE_NAME} (LOCATIONCODE, BILLNO, SLNO, ITEMCODE, QUANTITY, RATE, MANUFACTURERID)
-                VALUES (:loc, :billno, :slno, :itemcode, :quantity, :rate, :manufacturerid)
-            """, dtl_bind_fallback)
+            cur.execute(f"""
+                SELECT 1 FROM {HOLD_TABLE_NAME}
+                WHERE BILLNO = :billno AND LOCATIONCODE = :loc
+                  AND (FLAG = :held OR FLAG IS NULL)
+                  AND ROWNUM = 1
+            """, billno=bill_no, loc=loc_num, held=FLAG_HELD)
+            if cur.fetchone():
+                return
+        except oracledb.Error:
+            pass
+        cur.execute(f"DELETE FROM {HOLD_DTL_TABLE_NAME} WHERE BILLNO = :billno", billno=bill_no)
+        return
+
+    desired = []
+    for it in items or []:
+        if not isinstance(it, dict) or it.get('void'):
+            continue
+        desired.append(_item_to_dtl_param(it, bill_no, location_code, 0, item_flag=item_flag))
+
+    desired_keys = set()
+    for p in desired:
+        desired_keys.add(_cart_dtl_line_key(p.get('itemcode'), p.get('manufacturerid')))
+
+    existing_rows = []
+    try:
+        cur.execute(f"""
+            SELECT SLNO, ITEMCODE, MANUFACTURERID, QUANTITY, RATE
+            FROM {HOLD_DTL_TABLE_NAME}
+            WHERE BILLNO = :billno
+            ORDER BY SLNO
+        """, billno=bill_no)
+        existing_rows = cur.fetchall() or []
+    except oracledb.Error:
+        existing_rows = []
+
+    existing_by_key = {}
+    max_slno = 0
+    for row in existing_rows:
+        slno = _to_int(row[0], 0)
+        max_slno = max(max_slno, slno)
+        key = _cart_dtl_line_key(row[1], row[2])
+        existing_by_key[key] = {
+            'slno': slno,
+            'quantity': _to_float(row[3], 0.0),
+            'rate': _to_float(row[4], 0.0),
+        }
+
+    for key, meta in list(existing_by_key.items()):
+        if key not in desired_keys:
+            cur.execute(
+                f"DELETE FROM {HOLD_DTL_TABLE_NAME} WHERE BILLNO = :billno AND SLNO = :slno",
+                billno=bill_no,
+                slno=meta['slno'],
+            )
+            existing_by_key.pop(key, None)
+
+    to_insert = []
+    for p in desired:
+        key = _cart_dtl_line_key(p.get('itemcode'), p.get('manufacturerid'))
+        existing = existing_by_key.get(key)
+        if existing:
+            qty_new = _to_float(p.get('quantity'), 0.0)
+            rate_new = _to_float(p.get('rate'), 0.0)
+            if qty_new != existing['quantity'] or rate_new != existing['rate']:
+                try:
+                    cur.execute(f"""
+                        UPDATE {HOLD_DTL_TABLE_NAME}
+                        SET QUANTITY = :quantity, RATE = :rate,
+                            UNITOFMEASUREMENT = :unitofmeasurement,
+                            PREVPOINTS = :prevpoints, COSTPRICE = :costprice,
+                            RETAILPRICE = :retailprice, STORE = :store, ITEMFLAG = :itemflag
+                        WHERE BILLNO = :billno AND SLNO = :slno
+                    """, {
+                        'quantity': p['quantity'],
+                        'rate': p['rate'],
+                        'unitofmeasurement': p['unitofmeasurement'],
+                        'prevpoints': p['prevpoints'],
+                        'costprice': p['costprice'],
+                        'retailprice': p['retailprice'],
+                        'store': p['store'],
+                        'itemflag': p['itemflag'],
+                        'billno': bill_no,
+                        'slno': existing['slno'],
+                    })
+                except oracledb.Error as e:
+                    if 'ORA-00904' not in str(e).upper() and '00904' not in str(e).upper():
+                        raise
+                    cur.execute(f"""
+                        UPDATE {HOLD_DTL_TABLE_NAME}
+                        SET QUANTITY = :quantity, RATE = :rate
+                        WHERE BILLNO = :billno AND SLNO = :slno
+                    """, {
+                        'quantity': p['quantity'],
+                        'rate': p['rate'],
+                        'billno': bill_no,
+                        'slno': existing['slno'],
+                    })
+        else:
+            max_slno += 1
+            p['slno'] = max_slno
+            to_insert.append(p)
+
+    _executemany_tempbilldtl(cur, to_insert)
 
 
 def _cart_sync_execute(cur, conn, bill_no, location_code, items, extra_data=None):
@@ -6298,13 +8281,27 @@ def display_current_cart():
         if bill_no is None:
             return jsonify({"ok": True, "billNo": None, "items": [], "locationName": location_name}), 200
         _ensure_tempbilldtl(cur)
-        cur.execute("""
-            SELECT SLNO, ITEMCODE, QUANTITY, RATE, MANUFACTURERID
-            FROM """ + HOLD_DTL_TABLE_NAME + """
-            WHERE BILLNO = :billno
-            ORDER BY SLNO
-        """, billno=bill_no)
-        dtl_rows = cur.fetchall()
+        # Try to select with VOID column first; if it fails, fall back to selecting all columns
+        void_filter_clause = ""
+        try:
+            cur.execute("""
+                SELECT SLNO, ITEMCODE, QUANTITY, RATE, MANUFACTURERID, VOID
+                FROM """ + HOLD_DTL_TABLE_NAME + """
+                WHERE BILLNO = :billno AND (VOID IS NULL OR VOID = 0)
+                ORDER BY SLNO
+            """, billno=bill_no)
+            dtl_rows = cur.fetchall()
+        except oracledb.Error as e:
+            if 'ORA-00904' not in str(e).upper() and '00904' not in str(e).upper():
+                raise
+            # VOID column doesn't exist; select without it
+            cur.execute("""
+                SELECT SLNO, ITEMCODE, QUANTITY, RATE, MANUFACTURERID
+                FROM """ + HOLD_DTL_TABLE_NAME + """
+                WHERE BILLNO = :billno
+                ORDER BY SLNO
+            """, billno=bill_no)
+            dtl_rows = cur.fetchall()
         cols = [c[0].upper() if c else '' for c in cur.description] if cur.description else []
         for row in dtl_rows:
             def _col(name, default=None):
@@ -6370,53 +8367,7 @@ def cart_by_bill():
     items = []
     try:
         cur = conn.cursor()
-        _ensure_tempbilldtl(cur)
-        cur.execute(f"""
-            SELECT SLNO, ITEMCODE, QUANTITY, RATE, MANUFACTURERID
-            FROM {HOLD_DTL_TABLE_NAME}
-            WHERE BILLNO = :billno
-            ORDER BY SLNO
-        """, billno=bill_no)
-        dtl_rows = cur.fetchall()
-        cols = [c[0].upper() if c else '' for c in cur.description] if cur.description else []
-        for row in dtl_rows:
-            def _col(name, default=None):
-                try:
-                    i = cols.index(name)
-                    return row[i] if i >= 0 and i < len(row) else default
-                except (ValueError, IndexError):
-                    return default
-            itemcode = _col('ITEMCODE')
-            qty = _to_float(_col('QUANTITY'), 1.0)
-            rate = _to_float(_col('RATE'), 0.0)
-            manufacturer_id = _col('MANUFACTURERID')
-            code_str = str(itemcode).strip() if itemcode else ""
-            items.append({
-                "id": code_str or 0,
-                "name": "",
-                "price": rate,
-                "quantity": qty,
-                "manufactureId": str(manufacturer_id).strip() if manufacturer_id else "",
-                "ITEMCODE": code_str,
-                "MANUFACTURERID": str(manufacturer_id).strip() if manufacturer_id else "",
-            })
-        itemcodes = [str(it.get("ITEMCODE") or it.get("id") or "").strip() for it in items if it.get("ITEMCODE") or it.get("id")]
-        if itemcodes:
-            details_map = _get_item_details_from_master(cur, itemcodes)
-            for it in items:
-                code = str(it.get("ITEMCODE") or it.get("id") or "").strip()
-                details = details_map.get(code) or {}
-                it["name"] = details.get("name") or ""
-                it["uom"] = details.get("baseuom") or ""
-                it["ITEMNAMEARA"] = details.get("itemnameara") or ""
-                cp = details.get("costprice")
-                if cp is not None:
-                    it["costPrice"] = cp
-                    it["COSTPRICE"] = cp
-                ac = details.get("averagecost")
-                if ac is not None:
-                    it["avgCost"] = ac
-                    it["AVERAGECOST"] = ac
+        items = _load_cart_items_from_tempbilldtl(cur, bill_no)
     except oracledb.Error as e:
         print(f"[Cart by-bill] {HOLD_DTL_TABLE_NAME} error: {e}")
     finally:
@@ -6468,6 +8419,8 @@ def cart_sync():
         extra = {
             'countercode': _cnt_sync,
             'customercode': customer_code_sync,
+            'username': (data.get('userName') or data.get('username') or '').strip(),
+            'userid': (data.get('userId') or data.get('userid') or '').strip(),
         }
         _cart_sync_execute(cur, conn, bill_no, location_code, items, extra_data=extra)
         conn.commit()
@@ -6497,6 +8450,8 @@ def list_held_bills():
     """List held bills from TEMPBILLHDR (FLAG=0). Return BILLNO, HELDDATE, items per bill."""
     location_code = (request.args.get('locationCode') or '').strip() or 'LOC001'
     loc_num = _location_to_num(location_code, 1)
+    counter_code = (request.args.get('counterCode') or '').strip()
+    created_by = (request.args.get('createdBy') or request.args.get('userId') or request.args.get('username') or '').strip()
     conn = _get_connection()
     result = []
     if conn:
@@ -6504,27 +8459,51 @@ def list_held_bills():
         try:
             cur = conn.cursor()
             _ensure_tempbillhdr(cur)
-            # Held bills: distinct BILLNO for this location with FLAG=0 (held)
-            cur.execute(f"""
-                SELECT DISTINCT BILLNO, LOCATIONCODE
+            
+            # Dynamically build SQL to filter by counterCode or createdBy
+            sql = f"""
+                SELECT BILLNO, LOCATIONCODE, MAX(CREATEDBY) AS CREATEDBY
                 FROM {HOLD_TABLE_NAME}
                 WHERE LOCATIONCODE = :loc AND (FLAG = :flag OR FLAG IS NULL)
+            """
+            params = {"loc": loc_num, "flag": FLAG_HELD}
+            if counter_code:
+                sql += " AND COUNTERCODE = :counter_code"
+                params["counter_code"] = counter_code
+            if created_by:
+                sql += " AND UPPER(CREATEDBY) = UPPER(:created_by)"
+                params["created_by"] = created_by
+                
+            sql += """
+                GROUP BY BILLNO, LOCATIONCODE
                 ORDER BY BILLNO DESC
-            """, loc=loc_num, flag=FLAG_HELD)
+            """
+            
+            cur.execute(sql, params)
             rows = cur.fetchall()
-            cols = [c[0] for c in cur.description]
+            cols = [c[0].upper() if c else '' for c in cur.description] if cur.description else []
             result = [dict(zip(cols, row)) for row in rows]
             for r in result:
                 r["HELDDATE"] = None
                 r["items"] = []
+                
             # Try to get HELDDATE if column exists (MAX per bill)
             try:
-                cur.execute(f"""
+                sql_hd = f"""
                     SELECT BILLNO, MAX(HELDDATE) AS HELDDATE
                     FROM {HOLD_TABLE_NAME}
                     WHERE LOCATIONCODE = :loc AND (FLAG = :flag OR FLAG IS NULL)
-                    GROUP BY BILLNO
-                """, loc=loc_num, flag=FLAG_HELD)
+                """
+                params_hd = {"loc": loc_num, "flag": FLAG_HELD}
+                if counter_code:
+                    sql_hd += " AND COUNTERCODE = :counter_code"
+                    params_hd["counter_code"] = counter_code
+                if created_by:
+                    sql_hd += " AND UPPER(CREATEDBY) = UPPER(:created_by)"
+                    params_hd["created_by"] = created_by
+                    
+                sql_hd += " GROUP BY BILLNO"
+                cur.execute(sql_hd, params_hd)
                 for row in cur.fetchall():
                     billno, hd = row[0], row[1] if len(row) > 1 else None
                     for r in result:
@@ -6533,54 +8512,20 @@ def list_held_bills():
                             break
             except oracledb.Error:
                 pass
-            # Fetch product details from TEMPBILLDTL per bill; look up product name from ITEMMASTER
+            include_items = request.args.get('includeItems') in ('1', 'true', 'True')
+            bill_ids = [r.get("BILLNO") for r in result if r.get("BILLNO") is not None]
+            summaries = _tempbilldtl_summary_by_bills(cur, bill_ids)
             for r in result:
                 billno = r.get("BILLNO")
+                sm = summaries.get(int(billno)) if billno is not None else None
+                r["lineCount"] = sm.get("lineCount", 0) if sm else 0
+                r["estimatedTotal"] = sm.get("estimatedTotal", 0.0) if sm else 0.0
                 r["items"] = []
-                try:
-                    cur.execute(f"""
-                        SELECT SLNO, ITEMCODE, QUANTITY, RATE, MANUFACTURERID
-                        FROM {HOLD_DTL_TABLE_NAME}
-                        WHERE BILLNO = :billno
-                        ORDER BY SLNO
-                    """, billno=billno)
-                    dtl_rows = cur.fetchall()
-                    cols = [c[0].upper() if c else '' for c in cur.description] if cur.description else []
-                    for row in dtl_rows:
-                        def _col(name, default=None):
-                            try:
-                                i = cols.index(name)
-                                return row[i] if i >= 0 and i < len(row) else default
-                            except (ValueError, IndexError):
-                                return default
-                        itemcode = _col('ITEMCODE')
-                        qty = _to_float(_col('QUANTITY'), 1.0)
-                        rate = _to_float(_col('RATE'), 0.0)
-                        manufacturer_id = _col('MANUFACTURERID')
-                        code_str = str(itemcode).strip() if itemcode else ""
-                        r["items"].append({
-                            "id": code_str or 0,
-                            "name": "",
-                            "price": rate,
-                            "quantity": qty,
-                            "manufactureId": str(manufacturer_id).strip() if manufacturer_id else "",
-                            "ITEMCODE": code_str,
-                        })
-                    # Look up product names from ITEMMASTER by ITEMCODE
-                    itemcodes = [str(it.get("ITEMCODE") or it.get("id") or "").strip() for it in r["items"] if it.get("ITEMCODE") or it.get("id")]
-                    names_map = _get_item_names_from_master(cur, itemcodes)
-                    for it in r["items"]:
-                        code = str(it.get("ITEMCODE") or it.get("id") or "").strip()
-                        it["name"] = names_map.get(code, "") or ""
-                except oracledb.Error:
-                    pass
-                if not r["items"]:
-                    cur.execute(f"""
-                        SELECT BILLNO FROM {HOLD_TABLE_NAME}
-                        WHERE BILLNO = :billno AND LOCATIONCODE = :loc AND (FLAG = :flag OR FLAG IS NULL)
-                    """, billno=billno, loc=loc_num, flag=FLAG_HELD)
-                    hold_rows = cur.fetchall()
-                    r["items"] = [{"id": 0, "name": "Item", "price": 0.0, "quantity": 1} for _ in hold_rows]
+                if include_items and billno is not None:
+                    try:
+                        r["items"] = _load_cart_items_from_tempbilldtl(cur, billno)
+                    except oracledb.Error:
+                        pass
             result.sort(key=lambda x: (x.get("HELDDATE") or "", x.get("BILLNO") or 0), reverse=True)
             return jsonify(result)
         except oracledb.Error as e:
@@ -6597,6 +8542,11 @@ def list_held_bills():
                 pass
     for (loc, bill_no), v in _held_bills_fallback.items():
         if loc == location_code and not v.get("retrieved"):
+            if counter_code and str(v.get("counterCode") or "").strip() != counter_code:
+                continue
+            fb_created = str(v.get("createdBy") or v.get("createdby") or "").strip()
+            if created_by and fb_created and fb_created.upper() != created_by.upper():
+                continue
             result.append({
                 "BILLNO": bill_no,
                 "LOCATIONCODE": loc,
@@ -6628,48 +8578,9 @@ def get_held_bill(bill_no):
             # Fetch product details from TEMPBILLDTL for this bill (cart items for retrieve)
             items = []
             try:
-                cur.execute(f"""
-                    SELECT SLNO, ITEMCODE, QUANTITY, RATE, MANUFACTURERID
-                    FROM {HOLD_DTL_TABLE_NAME}
-                    WHERE BILLNO = :billno
-                    ORDER BY SLNO
-                """, billno=bill_no)
-                dtl_rows = cur.fetchall()
-                cols = [c[0].upper() if c else '' for c in cur.description] if cur.description else []
-                for row in dtl_rows:
-                    def col(name, default=None):
-                        try:
-                            i = cols.index(name)
-                            return row[i] if i >= 0 and i < len(row) else default
-                        except (ValueError, IndexError):
-                            return default
-                    itemcode = col('ITEMCODE')
-                    qty = _to_float(col('QUANTITY'), 1.0)
-                    rate = _to_float(col('RATE'), 0.0)
-                    manufacturer_id = col('MANUFACTURERID')
-                    code_str = str(itemcode).strip() if itemcode else ""
-                    items.append({
-                        "id": code_str or 0,
-                        "name": "",
-                        "price": rate,
-                        "quantity": qty,
-                        "manufactureId": str(manufacturer_id).strip() if manufacturer_id else "",
-                        "ITEMCODE": code_str,
-                        "MANUFACTURERID": str(manufacturer_id).strip() if manufacturer_id else "",
-                    })
-                # Look up product names from ITEMMASTER by ITEMCODE and set name on each item
-                itemcodes = [str(it.get("ITEMCODE") or it.get("id") or "").strip() for it in items if it.get("ITEMCODE") or it.get("id")]
-                names_map = _get_item_names_from_master(cur, itemcodes)
-                for it in items:
-                    code = str(it.get("ITEMCODE") or it.get("id") or "").strip()
-                    it["name"] = names_map.get(code, "") or ""
+                items = _load_cart_items_from_tempbilldtl(cur, bill_no)
             except oracledb.Error:
                 pass
-            if not items:
-                items = [
-                    {"id": 0, "name": "Item", "price": 0.0, "quantity": 1}
-                    for _ in hdr_rows
-                ]
             return jsonify({"billNo": bill_no, "locationCode": location_code, "items": items})
         except oracledb.Error as e:
             print(f"{HOLD_TABLE_NAME} get error: {e}")

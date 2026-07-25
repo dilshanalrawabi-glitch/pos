@@ -216,9 +216,9 @@ export default function PrinterSettings() {
         <>
           <h3 className="printer-settings-section">Cash drawer</h3>
           <p className="printer-settings-desc">
-            Plug the drawer into the <strong>receipt printer</strong> kick port (RJ11). On a completed sale that includes{' '}
-            <strong>cash</strong> (including split with cash), the POS sends an Epson-style ESC/POS pulse before the paper cut.
-            Card-only, credit, and <strong>reprinted</strong> receipts do not open the drawer.
+            Plug the drawer into the <strong>receipt printer</strong> kick port (RJ11). When enabled, the POS sends an Epson-style ESC/POS pulse before the paper cut for{' '}
+            <strong>cash</strong> or <strong>card</strong> sales, and for <strong>split</strong> when cash is part of the payment.
+            Store <strong>credit</strong> and <strong>reprinted</strong> receipts do not open the drawer.
           </p>
           <label className="printer-settings-label" style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
             <input
@@ -230,7 +230,7 @@ export default function PrinterSettings() {
                 localStorage.setItem(DRAWER_ENABLE_KEY, on ? '1' : '0')
               }}
             />
-            Open cash drawer on sale (when payment includes cash)
+            Open cash drawer on sale (cash or card; split when cash is used)
           </label>
           <label className="printer-settings-label">Drawer kick pin (Epson-style)</label>
           <p className="printer-settings-desc">If the drawer does not open, try the other pin. Star or other brands may need different commands.</p>

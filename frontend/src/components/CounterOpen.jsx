@@ -40,6 +40,78 @@ function pickMoneyOptional(row, ...keys) {
   return undefined
 }
 
+function heldBillNo(row) {
+  const n = row?.BILLNO ?? row?.billNo
+  if (n == null || n === '') return null
+  return String(n).trim()
+}
+
+function heldDateRaw(row) {
+  return row?.HELDDATE ?? row?.heldDate ?? row?.BILLDATE ?? row?.billDate ?? null
+}
+
+function heldMatchesBillDate(row, isoYyyyMmDd) {
+  if (!isoYyyyMmDd) return true
+  const hd = heldDateRaw(row)
+  if (!hd) return true
+  return String(hd).slice(0, 10) === String(isoYyyyMmDd).trim()
+}
+
+function heldLineCount(row) {
+  const n = row?.lineCount ?? row?.LINECOUNT
+  if (n != null && n !== '') return Number(n) || 0
+  const items = row?.items
+  return Array.isArray(items) ? items.length : 0
+}
+
+function heldEstimatedTotal(row) {
+  const t = row?.estimatedTotal ?? row?.ESTIMATEDTOTAL
+  if (t != null && t !== '') return Number(t) || 0
+  const items = row?.items
+  if (!Array.isArray(items)) return 0
+  return items.reduce((sum, it) => {
+    const q = Number(it?.quantity ?? it?.qty ?? 0) || 0
+    const p = Number(it?.price ?? it?.PRICE ?? 0) || 0
+    return sum + q * p
+  }, 0)
+}
+
+function formatHeldWhen(hd) {
+  if (!hd) return '—'
+  const s = String(hd)
+  if (s.includes('T')) {
+    const [d, rest] = s.split('T')
+    const t = (rest || '').replace(/Z$/i, '').slice(0, 8)
+    return t ? `${d} ${t}` : d
+  }
+  return s.length > 19 ? s.slice(0, 19) : s
+}
+
+function holdItemCode(it) {
+  return String(it?.ITEMCODE ?? it?.itemCode ?? it?.id ?? '').trim() || '—'
+}
+
+function holdItemName(it) {
+  return String(it?.name ?? it?.NAME ?? '').trim() || '—'
+}
+
+function holdItemQty(it) {
+  return Number(it?.quantity ?? it?.qty ?? it?.QUANTITY ?? 0) || 0
+}
+
+function holdItemRate(it) {
+  return Number(it?.price ?? it?.rate ?? it?.RATE ?? 0) || 0
+}
+
+function holdItemLineTotal(it) {
+  return holdItemQty(it) * holdItemRate(it)
+}
+
+function holdItemsTotal(items) {
+  if (!Array.isArray(items)) return 0
+  return items.reduce((sum, it) => sum + holdItemLineTotal(it), 0)
+}
+
 /** Normalize API payload and derive checks: net = sales − returns; cash approx = net − card(sales) + card(returns) − credit − voucher */
 function buildSummaryView(data) {
   if (!data || data.ok === false) return null
@@ -89,6 +161,7 @@ function CounterOpen({
   counterCode: counterCodeFromParent = '',
   counterName: counterNameFromParent = '',
   onCounterOperationsChanged,
+  onOpenHoldBill,
 }) {
   const [date, setDate] = useState(todayStr())
   const [shiftCode, setShiftCode] = useState('')
@@ -107,6 +180,15 @@ function CounterOpen({
   const [showCloseConfirm, setShowCloseConfirm] = useState(false)
   const [closeConfirmTimeLabel, setCloseConfirmTimeLabel] = useState('')
   const [closing, setClosing] = useState(false)
+  const [heldBills, setHeldBills] = useState([])
+  const [suspendedBills, setSuspendedBills] = useState([])
+  const [pendingBillsLoading, setPendingBillsLoading] = useState(false)
+  const [pendingBillsError, setPendingBillsError] = useState(null)
+  const [holdDetailBillNo, setHoldDetailBillNo] = useState(null)
+  const [holdDetailHeldWhen, setHoldDetailHeldWhen] = useState('')
+  const [holdDetailItems, setHoldDetailItems] = useState([])
+  const [holdDetailLoading, setHoldDetailLoading] = useState(false)
+  const [holdDetailError, setHoldDetailError] = useState(null)
 
   const systemIp = typeof sessionStorage !== 'undefined' ? sessionStorage.getItem('pos_system_ip') || '' : ''
   const counterCodeFromRow = counters[0] ? (counters[0].counterCode ?? counters[0].COUNTERCODE ?? '').toString().trim() : ''
@@ -194,6 +276,52 @@ function CounterOpen({
     setPrintNotice(null)
   }, [date, counterCode, locationCode])
 
+  const loadPendingBills = useCallback(async () => {
+    if (!apiBase || !date) return { held: [], suspended: [] }
+    setPendingBillsLoading(true)
+    setPendingBillsError(null)
+    const headers = {}
+    if (token) headers.Authorization = `Bearer ${token}`
+    try {
+      const holdParams = new URLSearchParams()
+      if (locationCode) holdParams.set('locationCode', locationCode)
+      if (counterCode) holdParams.set('counterCode', counterCode)
+      const suspParams = new URLSearchParams({ date })
+      if (locationCode) suspParams.set('locationCode', locationCode)
+      if (counterCode) suspParams.set('counterCode', counterCode)
+      const holdQs = holdParams.toString()
+      const [holdRes, suspRes] = await Promise.all([
+        fetch(`${apiBase}/api/hold${holdQs ? `?${holdQs}` : ''}`, { headers }),
+        fetch(`${apiBase}/api/bills/suspended-by-date?${suspParams}`, { headers }),
+      ])
+      const holdData = await holdRes.json().catch(() => null)
+      const suspData = await suspRes.json().catch(() => ({}))
+      if (!holdRes.ok) {
+        const errObj = holdData && typeof holdData === 'object' && !Array.isArray(holdData) ? holdData : {}
+        throw new Error(errObj.error || `Failed to load held bills (${holdRes.status})`)
+      }
+      if (!suspRes.ok || !suspData.ok) {
+        throw new Error(suspData.error || `Failed to load suspended bills (${suspRes.status})`)
+      }
+      const held = Array.isArray(holdData) ? holdData : []
+      const suspended = Array.isArray(suspData.bills) ? suspData.bills : []
+      setHeldBills(held)
+      setSuspendedBills(suspended)
+      return { held, suspended }
+    } catch (e) {
+      setHeldBills([])
+      setSuspendedBills([])
+      setPendingBillsError(e?.message || String(e))
+      return { held: [], suspended: [] }
+    } finally {
+      setPendingBillsLoading(false)
+    }
+  }, [apiBase, date, locationCode, counterCode, token])
+
+  useEffect(() => {
+    loadPendingBills()
+  }, [loadPendingBills])
+
   useEffect(() => {
     if (!showCloseConfirm) return
     const onKey = (e) => {
@@ -202,6 +330,62 @@ function CounterOpen({
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [showCloseConfirm, closing])
+
+  const closeHoldDetail = useCallback(() => {
+    if (holdDetailLoading) return
+    setHoldDetailBillNo(null)
+    setHoldDetailHeldWhen('')
+    setHoldDetailItems([])
+    setHoldDetailError(null)
+  }, [holdDetailLoading])
+
+  const openHoldDetail = useCallback(
+    async (row) => {
+      const noStr = heldBillNo(row)
+      if (!noStr || !apiBase) return
+      const billNoNum = parseInt(noStr, 10)
+      if (Number.isNaN(billNoNum) || billNoNum < 1) return
+      if (typeof onOpenHoldBill === 'function') {
+        onOpenHoldBill(billNoNum, row)
+        return
+      }
+      const hd = heldDateRaw(row)
+      setHoldDetailBillNo(billNoNum)
+      setHoldDetailHeldWhen(formatHeldWhen(hd))
+      setHoldDetailItems([])
+      setHoldDetailError(null)
+      setHoldDetailLoading(true)
+      const headers = {}
+      if (token) headers.Authorization = `Bearer ${token}`
+      const loc = encodeURIComponent(locationCode || 'LOC001')
+      try {
+        const res = await fetch(`${apiBase}/api/hold/${billNoNum}?locationCode=${loc}`, { headers })
+        const data = await res.json().catch(() => ({}))
+        if (!res.ok) throw new Error(data.error || 'Could not load held bill')
+        setHoldDetailItems(Array.isArray(data.items) ? data.items : [])
+      } catch (e) {
+        const fallbackItems = Array.isArray(row?.items) ? row.items : []
+        if (fallbackItems.length > 0) {
+          setHoldDetailItems(fallbackItems)
+          setHoldDetailError(null)
+        } else {
+          setHoldDetailError(e?.message || String(e))
+        }
+      } finally {
+        setHoldDetailLoading(false)
+      }
+    },
+    [apiBase, locationCode, onOpenHoldBill, token]
+  )
+
+  useEffect(() => {
+    if (holdDetailBillNo == null) return
+    const onKey = (e) => {
+      if (e.key === 'Escape' && !holdDetailLoading) closeHoldDetail()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [holdDetailBillNo, holdDetailLoading, closeHoldDetail])
 
   const loadDailySummary = useCallback(async () => {
     if (!apiBase || !date) return null
@@ -221,6 +405,19 @@ function CounterOpen({
 
   const summaryView = useMemo(() => buildSummaryView(reportSummary), [reportSummary])
 
+  const filteredHeld = useMemo(
+    () => heldBills.filter((row) => heldBillNo(row) && heldMatchesBillDate(row, date)),
+    [heldBills, date]
+  )
+
+  const filteredSuspended = useMemo(() => suspendedBills, [suspendedBills])
+
+  const hasHoldBills = filteredHeld.length > 0
+  const holdBlockMessage =
+    filteredHeld.length === 1
+      ? 'Cannot close counter: 1 hold bill is still open. Retrieve and complete or clear it first.'
+      : `Cannot close counter: ${filteredHeld.length} hold bills are still open. Retrieve and complete or clear them first.`
+
   const makeClosePrintData = useCallback(
     (summary, slipKind) => {
       let s = {}
@@ -235,10 +432,9 @@ function CounterOpen({
       const locationTelephone =
         typeof localStorage !== 'undefined' ? (localStorage.getItem('pos_location_telephone') || '').trim() : ''
       const closedBy = (user?.username || user?.userid || '').toString().trim()
-      const uid = (user?.userid ?? '').toString().trim()
-      const un = (user?.username ?? '').toString().trim()
-      const cashierDisplay = [uid, un].filter(Boolean).join(' ').trim()
       const row = mergeCounterCloseSource(s)
+      const loggedCashier = String(row.loggedCashier ?? row.logged_cashier ?? '').trim()
+      const cashierDisplay = loggedCashier
       const cardByType = row.cardByType ?? row.card_by_type
       return {
         date,
@@ -251,15 +447,23 @@ function CounterOpen({
         totalReturns: pickMoney(row, 'totalReturns', 'total_returns', 'TOTALRETURNS', 'TotalReturns'),
         netTotal: pickMoney(row, 'netTotal', 'net_total', 'NETTOTAL', 'NetTotal'),
         closedBy,
-        cashierDisplay: cashierDisplay || closedBy,
+        cashierDisplay,
         totalCardAmount: pickMoney(row, 'totalCardAmount', 'total_card_amount', 'TOTALCARDAMOUNT', 'TotalCardAmount'),
         totalCardReturns: pickMoney(row, 'totalCardReturns', 'total_card_returns', 'TOTALCARDRETURNS', 'TotalCardReturns'),
         cardByType: cardByType && typeof cardByType === 'object' ? cardByType : {},
         discountTotal: pickMoney(row, 'discountTotal', 'discount_total', 'DISCOUNTTOTAL', 'DiscountTotal'),
         creditTotal: pickMoney(row, 'creditTotal', 'credit_total', 'CREDITTOTAL', 'CreditTotal'),
+        onlineTotal: pickMoney(row, 'onlineTotal', 'online_total', 'ONLINETOTAL', 'OnlineTotal'),
         voucherTotal: pickMoney(row, 'voucherTotal', 'voucher_total', 'VOUCHERTOTAL', 'VoucherTotal'),
         cashInBox: pickMoneyOptional(row, 'cashInBox', 'cash_in_box', 'CASHINBOX', 'CashInBox'),
-        crReconciled: 0,
+        crReconciled: pickMoney(
+          row,
+          'crReconciled',
+          'cr_reconciled',
+          'creditReturnTotal',
+          'credit_return_total',
+          'CREDITRETURNTOTAL'
+        ),
         slipKind,
       }
     },
@@ -321,6 +525,11 @@ function CounterOpen({
 
   const postClose = () => {
     if (!apiBase || !date || closing) return
+    if (hasHoldBills) {
+      setActionError(holdBlockMessage)
+      setShowCloseConfirm(false)
+      return
+    }
     setActionError(null)
     setPrintNotice(null)
     setClosing(true)
@@ -335,6 +544,7 @@ function CounterOpen({
       .then(async (data) => {
         if (!data.ok) {
           setActionError(data.error || 'Close failed')
+          if (data.holdBillCount > 0) loadPendingBills()
           return
         }
         await fetchStatus()
@@ -354,8 +564,19 @@ function CounterOpen({
       })
   }
 
-  const openCloseConfirm = () => {
+  const openCloseConfirm = async () => {
     if (!apiBase || !date) return
+    setActionError(null)
+    const { held } = await loadPendingBills()
+    const heldForDate = (held || []).filter((row) => heldBillNo(row) && heldMatchesBillDate(row, date))
+    if (heldForDate.length > 0) {
+      const msg =
+        heldForDate.length === 1
+          ? 'Cannot close counter: 1 hold bill is still open. Retrieve and complete or clear it first.'
+          : `Cannot close counter: ${heldForDate.length} hold bills are still open. Retrieve and complete or clear them first.`
+      setActionError(msg)
+      return
+    }
     setCloseConfirmTimeLabel(formatCloseConfirmDateTime())
     setShowCloseConfirm(true)
   }
@@ -411,7 +632,19 @@ function CounterOpen({
                 >
                   {reportLoading ? 'Loading…' : 'Copy print'}
                 </button>
-                <button type="button" className="counter-setup-save-btn counter-close-btn" onClick={openCloseConfirm}>
+                <button
+                  type="button"
+                  className="counter-setup-save-btn counter-close-btn"
+                  onClick={openCloseConfirm}
+                  disabled={hasHoldBills || pendingBillsLoading}
+                  title={
+                    hasHoldBills
+                      ? holdBlockMessage
+                      : pendingBillsLoading
+                        ? 'Checking hold bills…'
+                        : 'Close counter for this business day'
+                  }
+                >
                   Close
                 </button>
               </>
@@ -431,6 +664,7 @@ function CounterOpen({
                 fetchCounters()
                 fetchOpenedDates()
                 fetchStatus()
+                loadPendingBills()
               }}
             >
               Refresh
@@ -503,6 +737,111 @@ function CounterOpen({
                 </dd>
               </dl>
               {summaryView.note && <p className="counter-setup-muted" style={{ marginTop: 8 }}>{summaryView.note}</p>}
+            </div>
+          )}
+          {(isOpen || summaryView) && (
+            <div className="counter-close-pending">
+              <div className="counter-close-pending-head">
+                <h4 className="counter-close-report-title">Hold &amp; suspended bills</h4>
+                <button
+                  type="button"
+                  className="counter-setup-save-btn counter-setup-secondary"
+                  style={{ padding: '6px 12px', fontSize: 13 }}
+                  onClick={loadPendingBills}
+                  disabled={pendingBillsLoading}
+                  title="Reload hold and suspended lists"
+                >
+                  {pendingBillsLoading ? '…' : 'Refresh lists'}
+                </button>
+              </div>
+              <p className="counter-close-report-meta">
+                Business date <strong>{date}</strong>
+                {locationCode ? <> · Loc <strong>{locationCode}</strong></> : null}
+                {counterCode ? <> · Counter <strong>{counterCode}</strong></> : null}
+              </p>
+              {pendingBillsError && (
+                <p className="login-error" style={{ marginTop: 0, marginBottom: 8 }}>{pendingBillsError}</p>
+              )}
+              <div className="counter-close-pending-grid">
+                <div className="counter-close-pending-block">
+                  <div className="counter-close-pending-block-head">
+                    <span className="counter-close-pending-label">Hold bills</span>
+                    <span className="counter-close-pending-count">{filteredHeld.length}</span>
+                  </div>
+                  <div className="counter-close-pending-scroll">
+                    {pendingBillsLoading && heldBills.length === 0 && !pendingBillsError ? (
+                      <p className="counter-setup-muted">Loading…</p>
+                    ) : filteredHeld.length === 0 ? (
+                      <p className="counter-setup-muted">No held bills for this date.</p>
+                    ) : (
+                      <ul className="counter-close-pending-list">
+                        {filteredHeld.map((row) => {
+                          const no = heldBillNo(row)
+                          const hd = heldDateRaw(row)
+                          const lines = heldLineCount(row)
+                          const est = heldEstimatedTotal(row)
+                          return (
+                            <li key={`hold-${no}-${hd || ''}`} className="counter-close-pending-row">
+                              <button
+                                type="button"
+                                className="counter-close-pending-bill counter-close-pending-bill-btn"
+                                onClick={() => openHoldDetail(row)}
+                                title={typeof onOpenHoldBill === 'function' ? 'Open held bill in cart summary' : 'View full bill detail'}
+                              >
+                                Bill {no}
+                              </button>
+                              <span className="counter-close-pending-meta">{formatHeldWhen(hd)}</span>
+                              <span className="counter-close-pending-meta">
+                                {lines} line{lines === 1 ? '' : 's'}
+                              </span>
+                              <span className="counter-close-pending-amt">QAR {est.toFixed(2)}</span>
+                            </li>
+                          )
+                        })}
+                      </ul>
+                    )}
+                  </div>
+                </div>
+                <div className="counter-close-pending-block">
+                  <div className="counter-close-pending-block-head">
+                    <span className="counter-close-pending-label">Suspended bills</span>
+                    <span className="counter-close-pending-count">{filteredSuspended.length}</span>
+                  </div>
+                  <div className="counter-close-pending-scroll">
+                    {pendingBillsLoading && suspendedBills.length === 0 && !pendingBillsError ? (
+                      <p className="counter-setup-muted">Loading…</p>
+                    ) : filteredSuspended.length === 0 ? (
+                      <p className="counter-setup-muted">No suspended bills for this date.</p>
+                    ) : (
+                      <ul className="counter-close-pending-list">
+                        {filteredSuspended.map((b) => (
+                          <li
+                            key={`sus-${b.billNo}-${b.billTime || ''}`}
+                            className="counter-close-pending-row counter-close-pending-row-suspended"
+                          >
+                            <span className="counter-close-pending-bill">Bill {b.billNo}</span>
+                            <span className="counter-close-pending-meta">{b.billTime || '—'}</span>
+                            <span className="counter-close-pending-meta">{b.customerName || '—'}</span>
+                            <span className="counter-close-pending-amt">
+                              QAR {Number(b.netBillAmount || 0).toFixed(2)}
+                            </span>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                </div>
+              </div>
+              {hasHoldBills && (
+                <p className="counter-close-pending-warn counter-close-pending-blocked">
+                  {holdBlockMessage}
+                </p>
+              )}
+              {!hasHoldBills && filteredSuspended.length > 0 && (
+                <p className="counter-close-pending-warn">
+                  Suspended bills are on record; you may still close after reviewing them.
+                </p>
+              )}
             </div>
           )}
         </section>
@@ -583,6 +922,106 @@ function CounterOpen({
         </section>
       </div>
 
+      {holdDetailBillNo != null && (
+        <div
+          className="counter-hold-detail-overlay"
+          role="presentation"
+          onClick={closeHoldDetail}
+        >
+          <div
+            className="counter-hold-detail-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="counter-hold-detail-title"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="counter-hold-detail-header">
+              <h3 id="counter-hold-detail-title">Hold bill {holdDetailBillNo}</h3>
+              <button
+                type="button"
+                className="counter-close-confirm-close"
+                onClick={closeHoldDetail}
+                disabled={holdDetailLoading}
+                aria-label="Close"
+              >
+                ×
+              </button>
+            </div>
+            <div className="counter-hold-detail-body">
+              <p className="counter-hold-detail-meta">
+                Held <strong>{holdDetailHeldWhen}</strong>
+                {locationCode ? (
+                  <>
+                    {' '}
+                    · Loc <strong>{locationCode}</strong>
+                  </>
+                ) : null}
+              </p>
+              {holdDetailError && (
+                <p className="login-error" role="alert">
+                  {holdDetailError}
+                </p>
+              )}
+              {holdDetailLoading ? (
+                <p className="counter-setup-muted">Loading bill lines…</p>
+              ) : holdDetailItems.length === 0 && !holdDetailError ? (
+                <p className="counter-setup-muted">No line items on this held bill.</p>
+              ) : (
+                <div className="counter-hold-detail-table-wrap">
+                  <table className="counter-hold-detail-table">
+                    <thead>
+                      <tr>
+                        <th>#</th>
+                        <th>Code</th>
+                        <th>Item</th>
+                        <th className="counter-hold-detail-num">Qty</th>
+                        <th className="counter-hold-detail-num">Rate</th>
+                        <th className="counter-hold-detail-num">Amount</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {holdDetailItems.map((it, idx) => (
+                        <tr key={`${holdDetailBillNo}-${idx}-${holdItemCode(it)}`}>
+                          <td>{idx + 1}</td>
+                          <td>{holdItemCode(it)}</td>
+                          <td>{holdItemName(it)}</td>
+                          <td className="counter-hold-detail-num">{holdItemQty(it)}</td>
+                          <td className="counter-hold-detail-num">QAR {holdItemRate(it).toFixed(2)}</td>
+                          <td className="counter-hold-detail-num">
+                            QAR {holdItemLineTotal(it).toFixed(2)}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                    <tfoot>
+                      <tr>
+                        <td colSpan={5} className="counter-hold-detail-total-label">
+                          Total ({holdDetailItems.length} line
+                          {holdDetailItems.length === 1 ? '' : 's'})
+                        </td>
+                        <td className="counter-hold-detail-num counter-hold-detail-total-amt">
+                          <strong>QAR {holdItemsTotal(holdDetailItems).toFixed(2)}</strong>
+                        </td>
+                      </tr>
+                    </tfoot>
+                  </table>
+                </div>
+              )}
+            </div>
+            <div className="counter-hold-detail-actions">
+              <button
+                type="button"
+                className="counter-close-confirm-btn counter-close-confirm-btn-secondary"
+                onClick={closeHoldDetail}
+                disabled={holdDetailLoading}
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {showCloseConfirm && (
         <div
           className="counter-close-confirm-overlay"
@@ -633,7 +1072,20 @@ function CounterOpen({
                   <dt>Close time</dt>
                   <dd>{closeConfirmTimeLabel}</dd>
                 </div>
+                <div className="counter-close-confirm-row">
+                  <dt>Hold bills</dt>
+                  <dd>{filteredHeld.length}</dd>
+                </div>
+                <div className="counter-close-confirm-row">
+                  <dt>Suspended bills</dt>
+                  <dd>{filteredSuspended.length}</dd>
+                </div>
               </dl>
+              {hasHoldBills && (
+                <p className="counter-close-pending-warn counter-close-confirm-pending-warn">
+                  {holdBlockMessage}
+                </p>
+              )}
               <p className="counter-close-confirm-hint">Confirm only after cash and reports are finalized.</p>
             </div>
             <div className="counter-close-confirm-actions">
@@ -649,7 +1101,8 @@ function CounterOpen({
                 type="button"
                 className="counter-close-confirm-btn counter-close-confirm-btn-danger"
                 onClick={postClose}
-                disabled={closing}
+                disabled={closing || hasHoldBills}
+                title={hasHoldBills ? holdBlockMessage : undefined}
               >
                 {closing ? 'Closing…' : 'Confirm close'}
               </button>

@@ -1,6 +1,7 @@
-import { useState, useRef } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import '../styles/Login.css'
 import { getApiBase } from '../apiBase'
+import { useKeyboard } from '../context/KeyboardContext'
 
 function launcherDownloadHref() {
   const override = import.meta.env.VITE_LAUNCHER_DOWNLOAD_URL
@@ -11,17 +12,35 @@ function launcherDownloadHref() {
 }
 
 function Login({ onLogin, loading, error }) {
+  const { setFocusedInput } = useKeyboard()
   const [employeecode, setEmployeecode] = useState('')
   const [password, setPassword] = useState('')
-  const [passwordEditable, setPasswordEditable] = useState(false)
+  const employeecodeRef = useRef(null)
   const passwordRef = useRef(null)
   const submitRef = useRef(null)
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      if (employeecodeRef.current) {
+        employeecodeRef.current.focus({ preventScroll: true })
+      }
+    }, 100)
+    return () => clearTimeout(timer)
+  }, [])
+
+  const handleInputClick = (e) => {
+    setFocusedInput(e.currentTarget)
+  }
 
   const focusNextFromEmployee = (e) => {
     if (e.key === 'Enter' && e.nativeEvent.isComposing) return
     if (e.key !== 'Enter' && e.key !== 'ArrowDown') return
     e.preventDefault()
-    passwordRef.current?.focus()
+    const delay = e.key === 'Enter' ? 100 : 0
+    setTimeout(() => {
+      const next = passwordRef.current
+      next?.focus({ preventScroll: true })
+    }, delay)
   }
 
   const focusSubmitFromPassword = (e) => {
@@ -45,16 +64,18 @@ function Login({ onLogin, loading, error }) {
           <div className="form-group">
             <label htmlFor="employeecode">Employee code</label>
             <input
+              ref={employeecodeRef}
               id="employeecode"
               name="employeecode"
               type="text"
               value={employeecode}
               onChange={(e) => setEmployeecode(e.target.value)}
+              onClick={handleInputClick}
               onKeyDown={focusNextFromEmployee}
               placeholder="Employee code"
               autoComplete="off"
               spellCheck={false}
-              autoFocus
+              data-no-osk="true"
               required
             />
           </div>
@@ -67,12 +88,12 @@ function Login({ onLogin, loading, error }) {
               type="password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
+              onClick={handleInputClick}
               onKeyDown={focusSubmitFromPassword}
               placeholder="••••••••"
               autoComplete="off"
               spellCheck={false}
-              readOnly={!passwordEditable}
-              onFocus={() => setPasswordEditable(true)}
+              data-no-osk="true"
               required
             />
           </div>

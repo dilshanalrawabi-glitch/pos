@@ -60,3 +60,53 @@ button:focus-visible {
     color: #0d9488;
   }
 }
+
+/* Global Touch and POS Kiosk Optimizations */
+button,
+input[type="button"],
+input[type="submit"],
+[role="button"],
+.pos-action-btn,
+.pos-action-btn-primary,
+.pos-action-btn-secondary,
+.pos-action-btn-void,
+.pos-action-btn-discount,
+.pos-action-btn-hold,
+.pos-action-btn-suspend,
+.qty-keypad-key,
+.payment-key,
+.payment-pay-btn,
+.payment-method-btn,
+.qty-modal-btn,
+.add-button,
+.billing-keypad-key,
+.dashboard-customer-option,
+.dashboard-channel-option,
+.dashboard-product-list-row,
+.cart-item-row,
+.qty-modal-row,
+.product-card,
+.qty-modal-close,
+.customer-add-btn-cancel,
+.customer-add-btn-save {
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
+  -webkit-user-select: none;
+  -moz-user-select: none;
+  -ms-user-select: none;
+}
+
+/* Ensure smooth kiosk vertical scrolling without double tap delay on lists */
+.products-column-container,
+.product-display,
+.dashboard-left,
+.dashboard-cart-section,
+.qty-modal-list,
+.qty-modal-body,
+.dashboard-customer-dropdown,
+.dashboard-channel-dropdown,
+.payment-order-lines {
+  touch-action: pan-y;
+  -webkit-overflow-scrolling: touch;
+}

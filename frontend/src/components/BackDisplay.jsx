@@ -1,6 +1,10 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import '../styles/BackDisplay.css'
-import { getApiBase } from '../apiBase'
+import {
+  matchesBackDisplayScope,
+  requestBackDisplaySync,
+  subscribeBackDisplay,
+} from '../utils/backDisplayChannel'
 
 /** Piece counts and fractional kg (weighted items) — avoid trimming decimals to integers. */
 function formatBackDisplayQty(n) {
@@ -15,12 +19,14 @@ function formatBackDisplayQty(n) {
 
 function BackDisplay() {
   const [items, setItems] = useState([])
-  const [error, setError] = useState(null)
+  const [total, setTotal] = useState(0)
+  const [connected, setConnected] = useState(false)
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [showThankYou, setShowThankYou] = useState(false)
   const [locationName, setLocationName] = useState('')
   const itemsScrollRef = useRef(null)
   const prevItemCountRef = useRef(0)
+  const connectedRef = useRef(false)
 
   useEffect(() => {
     const onChange = () => {
@@ -44,28 +50,31 @@ function BackDisplay() {
   const locationCode = params.get('locationCode') || params.get('location_code') || sessionStorage.getItem('pos_location') || 'LOC001'
 
   useEffect(() => {
-    const fetchCurrent = () => {
-      const url = `${getApiBase()}/api/display/current?counterCode=${encodeURIComponent(counterCode)}&locationCode=${encodeURIComponent(locationCode)}`
-      fetch(url)
-        .then((res) => res.json())
-        .then((data) => {
-          if (data && data.ok !== false) {
-            setItems(Array.isArray(data.items) ? data.items : [])
-            setLocationName(typeof data.locationName === 'string' ? data.locationName.trim() : '')
-            setError(null)
-          } else {
-            setError(data?.error || 'Failed to load')
-          }
-        })
-        .catch((err) => {
-          setError(err.message || 'Connection error')
-          setItems([])
-        })
+    connectedRef.current = false
+    setConnected(false)
+
+    const applySync = (data) => {
+      if (!matchesBackDisplayScope(data, counterCode, locationCode)) return
+      connectedRef.current = true
+      setItems(Array.isArray(data.items) ? data.items : [])
+      setTotal(Number.isFinite(Number(data.total)) ? Number(data.total) : 0)
+      setLocationName(typeof data.locationName === 'string' ? data.locationName.trim() : '')
+      setConnected(true)
     }
 
-    fetchCurrent()
-    const interval = setInterval(fetchCurrent, 2000)
-    return () => clearInterval(interval)
+    const unsub = subscribeBackDisplay((data) => {
+      if (data?.type === 'sync') applySync(data)
+    })
+
+    requestBackDisplaySync(counterCode, locationCode)
+    const retryTimer = window.setInterval(() => {
+      if (!connectedRef.current) requestBackDisplaySync(counterCode, locationCode)
+    }, 3000)
+
+    return () => {
+      unsub()
+      window.clearInterval(retryTimer)
+    }
   }, [counterCode, locationCode])
 
   /** First line at top, last line at bottom; keep scroll pinned to bottom so newest lines stay visible above total. */
@@ -79,7 +88,6 @@ function BackDisplay() {
   }, [items])
 
   useEffect(() => {
-    if (error) return
     const prev = prevItemCountRef.current
     if (items.length > 0) {
       setShowThankYou(false)
@@ -87,21 +95,13 @@ function BackDisplay() {
       setShowThankYou(true)
     }
     prevItemCountRef.current = items.length
-  }, [items, error])
+  }, [items])
 
   useEffect(() => {
     if (!showThankYou) return
     const t = window.setTimeout(() => setShowThankYou(false), 12000)
     return () => window.clearTimeout(t)
   }, [showThankYou])
-
-  const total = items.reduce((sum, item) => {
-    const qty = Number(item.quantity ?? item.QUANTITY)
-    const price = Number(item.price ?? item.RATE)
-    const q = Number.isFinite(qty) ? qty : 0
-    const p = Number.isFinite(price) ? price : 0
-    return sum + q * p
-  }, 0)
 
   return (
     <div className="back-display">
@@ -112,13 +112,14 @@ function BackDisplay() {
       ) : null}
 
       <div className="back-display-main">
-        {error && (
-          <div className="back-display-error">
-            {error}
+        {!connected && items.length === 0 && (
+          <div className="back-display-idle">
+            <p className="back-display-idle-text">Welcome</p>
+            <p className="back-display-idle-sub">Waiting for cashier screen…</p>
           </div>
         )}
 
-        {!error && items.length === 0 && (
+        {connected && items.length === 0 && (
           <div className="back-display-idle">
             {showThankYou ? (
               <p className="back-display-idle-text">Thank you</p>
@@ -131,7 +132,7 @@ function BackDisplay() {
           </div>
         )}
 
-        {!error && items.length > 0 && (
+        {items.length > 0 && (
           <div className="back-display-cart">
             <div className="back-display-items" ref={itemsScrollRef}>
               <div className="back-display-line back-display-header-row">
@@ -143,14 +144,15 @@ function BackDisplay() {
               </div>
               {items.map((item, index) => {
                 const sl = index + 1
-                const qtyRaw = Number(item.quantity ?? item.QUANTITY)
+                const qtyRaw = Number(item.quantity)
                 const qty = Number.isFinite(qtyRaw) ? qtyRaw : 0
-                const priceRaw = Number(item.price ?? item.RATE)
+                const priceRaw = Number(item.price)
                 const price = Number.isFinite(priceRaw) ? priceRaw : 0
-                const amount = qty * price
-                const name = (item.name || item.ITEMNAME || '').trim() || `Item ${item.ITEMCODE || item.id || sl}`
+                const amountRaw = Number(item.amount)
+                const amount = Number.isFinite(amountRaw) ? amountRaw : qty * price
+                const name = (item.name || '').trim() || `Item ${item.id || sl}`
                 return (
-                  <div key={`${item.ITEMCODE || item.id || 'item'}-${sl}-${index}`} className="back-display-line">
+                  <div key={`${item.id || 'item'}-${sl}-${index}`} className="back-display-line">
                     <span className="back-display-line-sl">{sl}</span>
                     <span className="back-display-line-name">{name}</span>
                     <span className="back-display-line-qty">{formatBackDisplayQty(qty)}</span>

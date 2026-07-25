@@ -1,5 +1,12 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useMemo, useCallback } from 'react'
 import '../styles/ProductDisplay.css'
+import { buildProductLookupMap, lookupProductByCode } from '../utils/productLookup'
+import {
+  isWeightedVegetableBarcode,
+  shouldBackgroundEnrichLocalProduct,
+  mapLocalProductToCart,
+  fetchProductLookup,
+} from '../utils/scanProductLookup'
 
 const POS_BUTTONS = [
   { id: 'sales-return', label: 'Sales Return', desc: 'Sales return' },
@@ -8,34 +15,18 @@ const POS_BUTTONS = [
   { id: 'pay', label: 'Pay', desc: 'Proceed to payment' },
 ]
 
-function mapLookupToProduct(p) {
-  const isWeighted = !!(p.IS_WEIGHTED_ITEM ?? p.isWeightedItem)
-  const weightKg = p.WEIGHTKG ?? p.weightKg
-  return {
-    id: p.ITEMCODE,
-    name: p.ITEMNAME,
-    nameAr: (p.ITEMNAMEARA ?? p.itemnameara ?? '').toString().trim() || undefined,
-    price: parseFloat(p.RETAILPRICE) || 0,
-    category: p.CATEGORYCODE,
-    image: '📦',
-    manufactureId: (p.MANUFACTUREID ?? p.manufactureid ?? p.ITEMCODE ?? '').toString().trim(),
-    uom: (p.BASEUOM ?? p.baseuom ?? '').toString().trim() || undefined,
-    factor: p.Factor ?? p.factor,
-    Factor: p.Factor ?? p.factor,
-    costPrice: p.COSTPRICE ?? p.costprice,
-    COSTPRICE: p.COSTPRICE ?? p.costprice,
-    store: p.STORE ?? p.store,
-    STORE: p.STORE ?? p.store,
-    avgCost: p.AVERAGECOST ?? p.averagecost ?? p.avgcost,
-    AVERAGECOST: p.AVERAGECOST ?? p.averagecost ?? p.avgcost,
-    isWeightedItem: isWeighted,
-    weightKg: weightKg != null ? Number(weightKg) : undefined,
-    quantity: isWeighted && (weightKg != null && weightKg !== '') ? Number(weightKg) : undefined,
-  }
-}
-
-function ProductDisplay({ products, onAddToCart, cartItems, onPosAction, onHold, onHoldRetrieve, apiBase }) {
+function ProductDisplay({ products, productLookupMap: productLookupMapProp, onAddToCart, onMergeCartLine, cartItems, onPosAction, onHold, onHoldRetrieve, apiBase }) {
   const [scanCode, setScanCode] = useState('')
+  const lookupMap = useMemo(
+    () => (productLookupMapProp && productLookupMapProp.size > 0
+      ? productLookupMapProp
+      : buildProductLookupMap(products)),
+    [productLookupMapProp, products]
+  )
+  const lookupMapRef = useRef(lookupMap)
+  lookupMapRef.current = lookupMap
+  const scanQueueRef = useRef([])
+  const scanProcessingRef = useRef(false)
   const [scanMsg, setScanMsg] = useState(null)
   const [scanFieldEditable, setScanFieldEditable] = useState(false)
   const scanInputRef = useRef(null)
@@ -46,37 +37,80 @@ function ProductDisplay({ products, onAddToCart, cartItems, onPosAction, onHold,
     return () => clearTimeout(t)
   }, [scanMsg])
 
-  const handleScanSubmit = async (e) => {
+  const runBackgroundEnrich = useCallback((code) => {
+    if (!apiBase) return
+    fetchProductLookup(apiBase, code)
+      .then((enriched) => {
+        if (enriched) onMergeCartLine?.(enriched)
+      })
+      .catch(() => {})
+  }, [apiBase, onMergeCartLine])
+
+  const processServerScan = useCallback(async (code) => {
+    if (!apiBase) {
+      setScanMsg(`Not found – Barcode: ${code}`)
+      return
+    }
+    try {
+      const product = await fetchProductLookup(apiBase, code)
+      if (product) {
+        onAddToCart(product)
+        setScanMsg(`Added: ${product.name} (Barcode: ${code})`)
+      } else {
+        setScanMsg(`Not found – Barcode: ${code}`)
+      }
+    } catch (err) {
+      console.error('Lookup error:', err)
+      setScanMsg(`Not found – Barcode: ${code}`)
+    }
+  }, [apiBase, onAddToCart])
+
+  const drainScanQueue = useCallback(async () => {
+    if (scanProcessingRef.current) return
+    scanProcessingRef.current = true
+    try {
+      while (scanQueueRef.current.length > 0) {
+        const code = scanQueueRef.current.shift()
+        await processServerScan(code)
+      }
+    } finally {
+      scanProcessingRef.current = false
+      scanInputRef.current?.focus()
+    }
+  }, [processServerScan])
+
+  const handleScanCode = useCallback((code) => {
+    const trimmed = String(code ?? '').trim()
+    if (!trimmed) return
+
+    if (isWeightedVegetableBarcode(trimmed)) {
+      scanQueueRef.current.push(trimmed)
+      void drainScanQueue()
+      return
+    }
+
+    const localRaw = lookupProductByCode(lookupMapRef.current, trimmed)
+    if (localRaw) {
+      const product = mapLocalProductToCart(localRaw, trimmed)
+      onAddToCart(product)
+      setScanMsg(`Added: ${product.name} (Barcode: ${trimmed})`)
+      if (shouldBackgroundEnrichLocalProduct(localRaw, trimmed)) {
+        runBackgroundEnrich(trimmed)
+      }
+      scanInputRef.current?.focus()
+      return
+    }
+
+    scanQueueRef.current.push(trimmed)
+    void drainScanQueue()
+  }, [onAddToCart, drainScanQueue, runBackgroundEnrich])
+
+  const handleScanSubmit = (e) => {
     e.preventDefault()
     const code = (scanCode || '').toString().trim()
     setScanCode('')
     if (!code) return
-    let product = null
-    if (apiBase) {
-      try {
-        const res = await fetch(`${apiBase}/api/products/lookup?code=${encodeURIComponent(code)}`)
-        const data = await res.json().catch(() => ({}))
-        if (res.ok && data.found !== false && (data.ITEMCODE != null || data.itemcode != null)) {
-          product = mapLookupToProduct(data)
-        }
-      } catch (err) {
-        console.error('Lookup error:', err)
-      }
-    }
-    if (!product) {
-      product = products.find(
-        (p) =>
-          String(p.manufactureId ?? '').trim() === code ||
-          String(p.id ?? '').trim() === code ||
-          (Array.isArray(p.alternateCodes) && p.alternateCodes.some((alt) => String(alt ?? '').trim() === code))
-      )
-    }
-    if (product) {
-      onAddToCart(product)
-      setScanMsg(`Added: ${product.name} (Barcode: ${code})`)
-    } else {
-      setScanMsg(`Not found – Barcode: ${code}`)
-    }
+    handleScanCode(code)
     scanInputRef.current?.focus()
   }
 

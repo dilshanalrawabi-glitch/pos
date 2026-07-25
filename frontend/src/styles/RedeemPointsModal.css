@@ -1,0 +1,197 @@
+.redeem-points-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.45);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10070;
+  padding: 16px;
+  box-sizing: border-box;
+}
+
+.redeem-points-modal {
+  background: #ffffff;
+  border-radius: 16px;
+  box-shadow: 0 16px 48px rgba(15, 23, 42, 0.18);
+  width: 100%;
+  max-width: 360px;
+  display: flex;
+  flex-direction: column;
+  padding: 20px 20px 24px;
+  border: 1px solid #e2e8f0;
+}
+
+.redeem-points-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+
+.redeem-points-title {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 700;
+  color: #78350f;
+  font-family: Georgia, 'Times New Roman', serif;
+  letter-spacing: -0.01em;
+}
+
+.redeem-points-close {
+  width: 32px;
+  height: 32px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  background: #f8fafc;
+  color: #64748b;
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s, color 0.15s;
+}
+
+.redeem-points-close:hover {
+  background: #f1f5f9;
+  color: #0f766e;
+}
+
+.redeem-points-toggle {
+  display: flex;
+  align-self: center;
+  background: #fef3c7;
+  border-radius: 999px;
+  padding: 4px;
+  gap: 4px;
+  margin-bottom: 20px;
+}
+
+.redeem-points-toggle-btn {
+  border: none;
+  background: transparent;
+  padding: 8px 24px;
+  border-radius: 999px;
+  font-size: 14px;
+  font-weight: 600;
+  color: #78716c;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, box-shadow 0.15s;
+}
+
+.redeem-points-toggle-btn.active {
+  background: #ffffff;
+  color: #0f172a;
+  box-shadow: 0 1px 4px rgba(15, 23, 42, 0.1);
+}
+
+.redeem-points-display {
+  text-align: center;
+  margin-bottom: 20px;
+}
+
+.redeem-points-primary {
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.redeem-points-value {
+  font-size: 42px;
+  font-weight: 800;
+  color: #0f172a;
+  letter-spacing: -0.03em;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+.redeem-points-unit {
+  font-size: 16px;
+  font-weight: 600;
+  color: #94a3b8;
+}
+
+.redeem-points-unit-prefix {
+  font-size: 18px;
+}
+
+.redeem-points-equiv {
+  font-size: 15px;
+  font-weight: 700;
+  color: #0f766e;
+  margin-bottom: 8px;
+}
+
+.redeem-points-meta {
+  font-size: 12px;
+  font-weight: 500;
+  color: #94a3b8;
+}
+
+.redeem-points-keypad {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.redeem-points-keypad-row {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+}
+
+.redeem-points-key {
+  flex: 1;
+  max-width: 96px;
+  height: 52px;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  background: #ffffff;
+  font-size: 20px;
+  font-weight: 600;
+  color: #0f172a;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s;
+}
+
+.redeem-points-key:hover:not(.redeem-points-key-spacer) {
+  background: #f8fafc;
+  border-color: #cbd5e1;
+}
+
+.redeem-points-key:active:not(.redeem-points-key-spacer) {
+  transform: scale(0.98);
+}
+
+.redeem-points-key-spacer {
+  visibility: hidden;
+  pointer-events: none;
+  border: none;
+}
+
+.redeem-points-key-back {
+  font-size: 18px;
+}
+
+.redeem-points-done {
+  width: 100%;
+  padding: 14px 20px;
+  border: none;
+  border-radius: 999px;
+  background: #0f766e;
+  color: #ffffff;
+  font-size: 16px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.redeem-points-done:hover {
+  background: #115e59;
+}

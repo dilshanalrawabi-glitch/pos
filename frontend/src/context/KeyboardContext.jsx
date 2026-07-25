@@ -2,11 +2,15 @@ import { createContext, useContext, useState, useCallback, useRef, useEffect } f
 
 const KeyboardContext = createContext(null)
 
+/** Wait after OSK Enter before hiding keyboard so pointer/touch release does not hit controls below (e.g. Checkout). */
+const OSK_ENTER_DISMISS_MS = 320
+
 export function KeyboardProvider({ children }) {
   const [inputValue, setInputValueState] = useState('')
   const [visible, setVisible] = useState(false)
   const focusedRef = useRef(null)
   const inputListenerRef = useRef(null)
+  const enterDismissTimerRef = useRef(null)
 
   const setInputValue = useCallback((value) => {
     setInputValueState(value)
@@ -30,7 +34,11 @@ export function KeyboardProvider({ children }) {
   }, [])
 
   const setFocusedInput = useCallback((el) => {
-    if (focusedRef.current === el) return
+    if (el && focusedRef.current === el) {
+      setVisible(true)
+      setInputValueState(el.value ?? '')
+      return
+    }
     if (focusedRef.current && inputListenerRef.current?._cleanup) {
       inputListenerRef.current._cleanup()
     }
@@ -61,6 +69,10 @@ export function KeyboardProvider({ children }) {
   }, [])
 
   const clearFocusedInput = useCallback(() => {
+    if (enterDismissTimerRef.current) {
+      clearTimeout(enterDismissTimerRef.current)
+      enterDismissTimerRef.current = null
+    }
     const el = focusedRef.current
     if (el) {
       el.blur()
@@ -89,16 +101,34 @@ export function KeyboardProvider({ children }) {
   )
 
   const pressEnterOnFocusedInput = useCallback(() => {
+    if (enterDismissTimerRef.current) {
+      clearTimeout(enterDismissTimerRef.current)
+      enterDismissTimerRef.current = null
+    }
     const el = focusedRef.current
+    const dismissTarget = el
     if (el) {
-      const opts = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }
-      el.dispatchEvent(new KeyboardEvent('keydown', opts))
-      el.dispatchEvent(new KeyboardEvent('keyup', opts))
-      if (el.form) {
-        el.form.requestSubmit()
+      const form = el.form
+      if (form) {
+        // One path only: synthetic Enter + requestSubmit() could run the form onSubmit twice
+        // (scanner / OSK / browser quirks) and skip straight to Pay on the next Enter.
+        form.requestSubmit()
+      } else {
+        const opts = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }
+        el.dispatchEvent(new KeyboardEvent('keydown', opts))
+        el.dispatchEvent(new KeyboardEvent('keyup', opts))
       }
     }
-    clearFocusedInput()
+    // Defer blur/hide: if we collapse the keyboard in the same gesture as Enter, layout shifts
+    // and pointerup can land on Checkout (ghost click).
+    enterDismissTimerRef.current = setTimeout(() => {
+      enterDismissTimerRef.current = null
+      if (dismissTarget && focusedRef.current === dismissTarget) {
+        clearFocusedInput()
+      } else if (!dismissTarget) {
+        clearFocusedInput()
+      }
+    }, OSK_ENTER_DISMISS_MS)
   }, [clearFocusedInput])
 
   const backspaceFocusedInput = useCallback(() => {
@@ -137,13 +167,39 @@ export function KeyboardProvider({ children }) {
       setFocusedInput(el)
     }
 
+    const isOskFocusTarget = (node) =>
+      !!node &&
+      !!node.closest &&
+      (node.closest('.on-screen-keyboard-wrapper') ||
+        node.closest('.simple-keyboard-container') ||
+        node.closest('.hg-theme-default') ||
+        node.closest('.simple-keyboard'))
+
     const handleFocusOut = (e) => {
       const related = e.relatedTarget
-      if (related?.closest?.('input') || related?.closest?.('textarea') || related?.closest?.('.on-screen-keyboard-wrapper') || related?.closest?.('.hg-theme-default') || related?.closest?.('.simple-keyboard')) return
-      if (related?.closest?.('[data-keyboard-toggle="true"]')) return
-      if (e.target === focusedRef.current) {
-        clearFocusedInput()
+      const leaving = e.target
+      if (leaving !== focusedRef.current) return
+      if (
+        related?.closest?.('input') ||
+        related?.closest?.('textarea') ||
+        isOskFocusTarget(related) ||
+        related?.closest?.('[data-keyboard-toggle="true"]')
+      ) {
+        return
       }
+      if (related == null) {
+        queueMicrotask(() => {
+          if (focusedRef.current !== leaving) return
+          const ae = document.activeElement
+          if (ae === leaving) return
+          if (isOskFocusTarget(ae)) return
+          if (ae?.closest?.('input') || ae?.closest?.('textarea')) return
+          if (ae?.closest?.('[data-keyboard-toggle="true"]')) return
+          clearFocusedInput()
+        })
+        return
+      }
+      clearFocusedInput()
     }
 
     document.addEventListener('focusin', handleFocusIn)
@@ -174,6 +230,13 @@ export function KeyboardProvider({ children }) {
     }
     return () => document.body.classList.remove('keyboard-open')
   }, [visible])
+
+  useEffect(() => () => {
+    if (enterDismissTimerRef.current) {
+      clearTimeout(enterDismissTimerRef.current)
+      enterDismissTimerRef.current = null
+    }
+  }, [])
 
   return (
     <KeyboardContext.Provider value={value}>

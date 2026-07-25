@@ -1,5 +1,6 @@
 import '../styles/ProductDisplay.css'
 import { useKeyboard } from '../context/KeyboardContext'
+import { priceModeLabel } from '../utils/priceMode'
 
 const QtyPlusIcon = () => (
   <svg width="22" height="22" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden>
@@ -16,18 +17,23 @@ const QtyMinusIcon = () => (
 const POS_BUTTONS = [
   { id: 'sales-return', label: 'Sales Return', desc: 'Sales return' },
   { id: 'customer-add', label: 'Customer add', desc: 'Register a new customer' },
+  { id: 'order-no', label: 'Order No', desc: 'Add order number' },
   { id: 'hold', label: 'Hold', desc: 'Hold bill' },
   { id: 'hold-retrieve', label: 'Hold Retrieve', desc: 'Release held bill' },
   { id: 'void-line', label: 'Void line', desc: 'Remove last line from bill' },
   { id: 'suspend-bill', label: 'Suspend bill', desc: 'Suspend current bill' },
+  { id: 'price-check', label: 'Price check', desc: 'Check item price by barcode' },
+  { id: 'price-mode', label: 'Price mode', desc: 'Wholesale or offer pricing for new items' },
   { id: 'qty', label: 'Quantity', desc: 'Increase or decrease cart quantity' },
-  { id: 'pay', label: 'Pay', desc: 'Proceed to payment' },
 ]
+
+function posActionMouseDown(e) {
+  e.preventDefault()
+}
 
 function PosActionsBar({
   cartItems,
   selectedCartItemId,
-  selectedCustomer,
   onHold,
   onHoldRetrieve,
   onVoidLine,
@@ -35,18 +41,19 @@ function PosActionsBar({
   onQtyIncrease,
   onQtyDecrease,
   onPosAction,
-  onCheckout,
-  checkoutLoading = false,
   isSalesReturn,
-  /** When set, qty +/- tooltips use return wording if this or cart has return lines (toggle still uses `isSalesReturn`). */
   qtyReturnMode,
   onToggleSalesReturn,
   onCustomerAdd,
+  onOrderNo,
+  onPriceCheck,
+  priceMode,
+  onPriceModeClick,
 }) {
   const { clearFocusedInput } = useKeyboard()
   const qtyReturnContext = qtyReturnMode != null ? qtyReturnMode : isSalesReturn
-  const isCreditCustomer = selectedCustomer && (selectedCustomer.INVOICECODE === 2 || selectedCustomer.INVOICECODE === '2' || selectedCustomer.invoicecode === 2 || selectedCustomer.invoicecode === '2')
-  const payButtonLabel = isCreditCustomer ? 'Checkout' : 'Pay'
+  const priceModeActive = !!priceMode
+
   const handleClick = (id) => {
     clearFocusedInput()
     if (id === 'sales-return') {
@@ -56,6 +63,10 @@ function PosActionsBar({
     }
     if (id === 'customer-add') {
       if (onCustomerAdd) onCustomerAdd()
+      return
+    }
+    if (id === 'order-no') {
+      if (onOrderNo) onOrderNo()
       return
     }
     if (id === 'hold') {
@@ -78,13 +89,16 @@ function PosActionsBar({
       else alert('Suspend bill – suspend current bill')
       return
     }
-    if (id === 'pay' && onCheckout) {
-      if (checkoutLoading) return
-      onCheckout()
+    if (id === 'price-check') {
+      if (onPriceCheck) onPriceCheck()
+      else alert('Price check – scanning or entering code to view price')
+      return
+    }
+    if (id === 'price-mode') {
+      if (onPriceModeClick) onPriceModeClick()
       return
     }
     if (onPosAction) onPosAction(id)
-    else if (id === 'pay') alert('Pay – proceed to payment')
   }
 
   const qtyStepDisabled = !cartItems?.some((i) => !i.void)
@@ -100,6 +114,7 @@ function PosActionsBar({
               key="qty-inc"
               type="button"
               className="pos-action-btn pos-action-btn-secondary pos-action-btn-qty-step"
+              onMouseDown={posActionMouseDown}
               onClick={() => {
                 clearFocusedInput()
                 if (onQtyIncrease) onQtyIncrease()
@@ -117,6 +132,7 @@ function PosActionsBar({
               key="qty-dec"
               type="button"
               className="pos-action-btn pos-action-btn-secondary pos-action-btn-qty-step"
+              onMouseDown={posActionMouseDown}
               onClick={() => {
                 clearFocusedInput()
                 if (onQtyDecrease) onQtyDecrease()
@@ -132,37 +148,39 @@ function PosActionsBar({
             </button>,
           ]
         }
+        const isPriceModeBtn = btn.id === 'price-mode'
+        const isActivePriceMode = isPriceModeBtn && priceModeActive
         return (
           <button
             key={btn.id}
             type="button"
-            className={`pos-action-btn ${btn.id === 'pay' ? 'pos-action-btn-primary' : ''} ${['customer-add', 'hold', 'hold-retrieve', 'void-line', 'suspend-bill'].includes(btn.id) ? 'pos-action-btn-secondary' : ''} ${btn.id === 'void-line' ? 'pos-action-btn-void' : ''} ${btn.id === 'hold' ? 'pos-action-btn-hold' : ''} ${btn.id === 'suspend-bill' ? 'pos-action-btn-suspend' : ''} ${btn.id === 'sales-return' && isSalesReturn ? 'pos-action-btn-return-active' : ''}`}
+            className={`pos-action-btn ${['customer-add', 'order-no', 'hold', 'hold-retrieve', 'void-line', 'suspend-bill', 'price-check', 'price-mode'].includes(btn.id) ? 'pos-action-btn-secondary' : ''} ${btn.id === 'void-line' ? 'pos-action-btn-void' : ''} ${btn.id === 'hold' ? 'pos-action-btn-hold' : ''} ${btn.id === 'suspend-bill' ? 'pos-action-btn-suspend' : ''} ${btn.id === 'sales-return' && isSalesReturn ? 'pos-action-btn-return-active' : ''} ${isActivePriceMode ? 'pos-action-btn-return-active' : ''}`}
+            onMouseDown={posActionMouseDown}
             onClick={() => handleClick(btn.id)}
             title={
               btn.id === 'sales-return'
                 ? isSalesReturn
                   ? 'Next add is a return, then back to normal sale. Click to cancel (stay on sale).'
                   : 'Click first: next item added is a return; after that, adds are normal sale without another click.'
-                : btn.desc
+                : isPriceModeBtn
+                  ? priceModeActive
+                    ? `${priceModeLabel(priceMode)} active — click to turn off (retail price).`
+                    : 'Choose wholesale or offer price for items added to the bill.'
+                  : btn.desc
             }
-            aria-pressed={btn.id === 'sales-return' ? isSalesReturn : undefined}
+            aria-pressed={btn.id === 'sales-return' ? isSalesReturn : isActivePriceMode ? true : undefined}
             disabled={
               (btn.id === 'hold' && !cartItems?.length) ||
               (btn.id === 'void-line' && (!cartItems?.length || !selectedCartItemId)) ||
-              (btn.id === 'suspend-bill' && !cartItems?.length) ||
-              (btn.id === 'pay' && checkoutLoading)
+              (btn.id === 'suspend-bill' && !cartItems?.length)
             }
           >
             <span className="pos-action-label">
-              {btn.id === 'pay' && checkoutLoading ? (
-                <span className="pos-action-pay-loader" aria-hidden="true" />
-              ) : btn.id === 'sales-return' ? (
-                'Sales Return'
-              ) : btn.id === 'pay' ? (
-                payButtonLabel
-              ) : (
-                btn.label
-              )}
+              {btn.id === 'sales-return'
+                ? 'Sales Return'
+                : isPriceModeBtn && priceModeActive
+                  ? priceModeLabel(priceMode)
+                  : btn.label}
             </span>
           </button>
         )

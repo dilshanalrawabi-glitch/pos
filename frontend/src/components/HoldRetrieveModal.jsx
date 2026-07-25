@@ -35,10 +35,10 @@ export default function HoldRetrieveModal({ open, onClose, locationCode, apiBase
       const data = await res.json()
       if (!res.ok) throw new Error(data.error || 'Held bill not found')
       onRetrieve(data.billNo, data.items || [])
-      await fetch(`${apiBase}/api/hold/${billNoNum}?locationCode=${loc}`, { method: 'DELETE' })
       setBillNoInput('')
       setBillNoEditable(false)
       onClose()
+      void fetch(`${apiBase}/api/hold/${billNoNum}?locationCode=${loc}`, { method: 'DELETE' }).catch(() => { })
     } catch (err) {
       setError(err.message || 'Failed to retrieve bill')
     } finally {

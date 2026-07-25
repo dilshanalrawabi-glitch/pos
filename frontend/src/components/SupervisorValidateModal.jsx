@@ -22,7 +22,9 @@ export default function SupervisorValidateModal({ open, onClose, onSuccess, acti
     e.preventDefault()
     const trimmed = (e.target.value || '').trim()
     setUsername(trimmed)
-    passwordInputRef.current?.focus()
+    setTimeout(() => {
+      passwordInputRef.current?.focus()
+    }, 100)
   }
 
   const handleSubmit = async (e) => {
